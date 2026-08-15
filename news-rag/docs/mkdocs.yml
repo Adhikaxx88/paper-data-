@@ -1,0 +1,58 @@
+site_name: News RAG Chatbot
+site_description: RAG pipeline and chatbot for Google News articles
+docs_dir: .
+site_dir: ../site
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.instant
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Setup: setup.md
+  - Pipeline:
+      - Scraper: pipeline/scraper.md
+      - Cleaner: pipeline/cleaner.md
+      - Chunker: pipeline/chunker.md
+      - Embedder: pipeline/embedder.md
+      - PDF Exporter: pipeline/pdf_exporter.md
+  - Database:
+      - PostgreSQL: database/postgres.md
+      - Qdrant: database/qdrant.md
+  - RAG:
+      - Retriever: rag/retriever.md
+      - Generator: rag/generator.md
+      - Pipeline: rag/pipeline.md
+  - Chatbot: chatbot.md

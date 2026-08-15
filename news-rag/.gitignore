@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/raw/*.json
+data/clean/*.json
+data/pdf/**/*.pdf
+credentials.json
+token.json
+site/
+.DS_Store
