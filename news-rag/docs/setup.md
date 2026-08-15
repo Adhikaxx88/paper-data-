@@ -169,3 +169,21 @@ docker compose run backend python -c "from db.qdrant_client import recreate_coll
 # 3. Re-embed everything (PostgreSQL text/article data is untouched and reused)
 docker compose run pipeline python run_pipeline.py --step embed
 ```
+
+## Frontend Development
+
+The FastAPI backend (`backend/main.py`) must be running for the frontend to
+have anything to talk to — either via Docker (`docker compose up -d postgres
+qdrant infinity ollama && docker compose up backend`) or locally
+(`uvicorn backend.main:app --reload`).
+
+Then, for hot-reloading frontend development outside Docker:
+
+```bash
+cd frontend
+npm install
+npm run dev    # http://localhost:5173, proxies /api to :8000
+```
+
+See [Frontend](frontend.md) for the component structure and how the UI talks
+to the backend.

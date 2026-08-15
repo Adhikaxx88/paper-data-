@@ -55,4 +55,4 @@ nav:
       - Retriever: rag/retriever.md
       - Generator: rag/generator.md
       - Pipeline: rag/pipeline.md
-  - Chatbot: chatbot.md
+  - Frontend: frontend.md

@@ -12,3 +12,5 @@ streamlit==1.36.0
 tiktoken==0.7.0
 mkdocs==1.6.0
 mkdocs-material==9.5.27
+fastapi==0.111.0
+uvicorn[standard]==0.30.1

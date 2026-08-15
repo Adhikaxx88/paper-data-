@@ -69,7 +69,7 @@ CREATE TABLE chat_messages (
 
 | Column | Description |
 |---|---|
-| `session_id` | One row per chatbot conversation (a Streamlit browser session). |
+| `session_id` | One row per chatbot conversation (a browser session, tracked client-side by the React frontend or Streamlit). |
 | `role` | `user` or `assistant`. |
 | `content` | The message text. |
 

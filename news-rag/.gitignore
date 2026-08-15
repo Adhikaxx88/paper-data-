@@ -1,4 +1,7 @@
 .env
+# frontend/.env only holds a non-secret default (VITE_API_URL) and is
+# intentionally committed as a working default for local dev.
+!frontend/.env
 __pycache__/
 *.pyc
 .venv/

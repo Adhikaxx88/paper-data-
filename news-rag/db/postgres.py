@@ -228,6 +228,29 @@ def insert_message(session_id: uuid.UUID, role: str, content: str) -> None:
             )
 
 
+def get_all_messages(session_id: uuid.UUID) -> list[dict[str, Any]]:
+    """Fetch every message in a session, oldest first.
+
+    Args:
+        session_id: The chat session's UUID.
+
+    Returns:
+        List of dicts with id, role, content, and created_at, ordered chronologically.
+    """
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, role, content, created_at
+                FROM chat_messages
+                WHERE session_id = %s
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+
 def get_recent_messages(session_id: uuid.UUID, limit: int) -> list[dict[str, Any]]:
     """Fetch the most recent messages in a session, oldest first.
 
