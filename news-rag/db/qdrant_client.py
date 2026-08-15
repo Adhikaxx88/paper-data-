@@ -6,7 +6,7 @@ from loguru import logger
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
-from config import EMBEDDING_DIM, QDRANT_API_KEY, QDRANT_COLLECTION, QDRANT_URL
+from config import EMBED_DIM, QDRANT_API_KEY, QDRANT_COLLECTION, QDRANT_URL
 
 _client: Optional[QdrantClient] = None
 
@@ -32,9 +32,31 @@ def init_collection() -> None:
         return
     client.create_collection(
         collection_name=QDRANT_COLLECTION,
-        vectors_config=qmodels.VectorParams(size=EMBEDDING_DIM, distance=qmodels.Distance.COSINE),
+        vectors_config=qmodels.VectorParams(size=EMBED_DIM, distance=qmodels.Distance.COSINE),
     )
-    logger.info(f"Created Qdrant collection '{QDRANT_COLLECTION}'")
+    logger.info(f"Created Qdrant collection '{QDRANT_COLLECTION}' (dim={EMBED_DIM})")
+
+
+def recreate_collection() -> None:
+    """Drop and recreate the news_chunks collection using the current EMBED_DIM.
+
+    Run this manually when changing embedding models (e.g. switching from
+    OpenAI's 1536-dim text-embedding-3-small to BGE's 1024-dim
+    bge-large-en-v1.5) to avoid a vector dimension mismatch. All previously
+    indexed vectors are lost — chunks must be re-embedded afterward via
+    `pipeline/embedder.py`. PostgreSQL data (articles, chunks text) is
+    unaffected and does not need to be re-scraped or re-chunked.
+    """
+    client = get_client()
+    existing = [c.name for c in client.get_collections().collections]
+    if QDRANT_COLLECTION in existing:
+        client.delete_collection(QDRANT_COLLECTION)
+        logger.info(f"Deleted Qdrant collection '{QDRANT_COLLECTION}'")
+    client.create_collection(
+        collection_name=QDRANT_COLLECTION,
+        vectors_config=qmodels.VectorParams(size=EMBED_DIM, distance=qmodels.Distance.COSINE),
+    )
+    logger.info(f"Recreated Qdrant collection '{QDRANT_COLLECTION}' (dim={EMBED_DIM})")
 
 
 def point_exists(chunk_id: uuid.UUID) -> bool:

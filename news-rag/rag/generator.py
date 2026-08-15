@@ -1,10 +1,10 @@
-"""Generate chatbot answers from retrieved context and conversation history using GPT-4o-mini."""
+"""Generate chatbot answers from retrieved context and conversation history using a local Ollama model."""
 from typing import Any, Optional
 
 from loguru import logger
 from openai import OpenAI
 
-from config import LLM_MODEL, OPENAI_API_KEY
+from config import OLLAMA_MODEL, OLLAMA_URL
 
 SYSTEM_PROMPT = """Anda adalah asisten berita yang menjawab pertanyaan HANYA berdasarkan konteks \
 berita yang diberikan di bawah ini. Jangan menggunakan pengetahuan di luar konteks.
@@ -19,15 +19,18 @@ Aturan:
 _client: Optional[OpenAI] = None
 
 
-def get_openai_client() -> OpenAI:
-    """Return a lazily-initialized, module-level OpenAI client.
+def get_llm_client() -> OpenAI:
+    """Return a lazily-initialized, module-level client for the local Ollama server.
+
+    Ollama exposes an OpenAI-compatible /v1/chat/completions endpoint, so the
+    OpenAI SDK is reused here pointed at a local base_url instead of OpenAI's API.
 
     Returns:
-        A configured OpenAI client instance.
+        A configured OpenAI client instance targeting Ollama.
     """
     global _client
     if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY)
+        _client = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
     return _client
 
 
@@ -76,7 +79,7 @@ def build_messages(
 
 
 def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[dict[str, str]]) -> str:
-    """Call GPT-4o-mini to produce an answer grounded in the retrieved context.
+    """Call the local Ollama model to produce an answer grounded in the retrieved context.
 
     Args:
         question: The current user question.
@@ -88,8 +91,8 @@ def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[d
     """
     messages = build_messages(question, chunks, history)
     try:
-        response = get_openai_client().chat.completions.create(
-            model=LLM_MODEL,
+        response = get_llm_client().chat.completions.create(
+            model=OLLAMA_MODEL,
             messages=messages,
             temperature=0.2,
         )

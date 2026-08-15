@@ -5,6 +5,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# OpenAI is now optional: the default local stack uses infinity-emb (BGE) for
+# embeddings and Ollama for generation instead. Keep this set only if you want
+# to point embedder/generator back at OpenAI-compatible endpoints.
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 POSTGRES_URL: str = os.getenv("POSTGRES_URL", "postgresql://user:password@localhost:5432/newsrag")
 QDRANT_URL: str = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -14,9 +17,14 @@ NEWS_KEYWORDS: list[str] = [
     kw.strip() for kw in os.getenv("NEWS_KEYWORDS", "pinjol,fintech,kredit digital").split(",") if kw.strip()
 ]
 
-EMBEDDING_MODEL: str = "text-embedding-3-small"
-EMBEDDING_DIM: int = 1536
-LLM_MODEL: str = "gpt-4o-mini"
+# Embedding — served locally by infinity-emb (OpenAI-compatible API)
+INFINITY_URL: str = os.getenv("INFINITY_URL", "http://infinity:7997")
+EMBED_MODEL: str = os.getenv("EMBED_MODEL", "BAAI/bge-large-en-v1.5")
+EMBED_DIM: int = int(os.getenv("EMBED_DIM", "1024"))
+
+# Generation — served locally by Ollama (OpenAI-compatible API)
+OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://ollama:11434/v1")
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
 
 QDRANT_COLLECTION: str = "news_chunks"
 

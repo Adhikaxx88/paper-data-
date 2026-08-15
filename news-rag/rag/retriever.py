@@ -8,6 +8,10 @@ from config import RETRIEVAL_TOP_K
 from db import postgres, qdrant_client
 from pipeline.embedder import embed_text
 
+# BGE models expect a different instruction prefix for search queries than
+# for indexed passages (see pipeline/embedder.py's PASSAGE_PREFIX).
+QUERY_PREFIX = "Represent this question for searching relevant passages: "
+
 
 def retrieve(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict[str, Any]]:
     """Embed a query, search Qdrant, and fetch matching chunk text from PostgreSQL.
@@ -20,7 +24,7 @@ def retrieve(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict[str, Any]]:
         List of dicts with chunk_text, title, source, date, category, url, and score,
         ordered by descending similarity score.
     """
-    query_vector = embed_text(query)
+    query_vector = embed_text(QUERY_PREFIX + query)
     hits = qdrant_client.search(query_vector, top_k)
     if not hits:
         logger.info(f"No Qdrant hits for query: {query!r}")

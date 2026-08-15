@@ -2,6 +2,17 @@
 
 `rag/generator.py`
 
+## Model
+
+By default, generation runs on **Llama 3.1** served locally by
+[Ollama](https://ollama.com) (the `ollama` service in `docker-compose.yml`).
+Ollama exposes an OpenAI-compatible `/v1/chat/completions` endpoint, so
+`rag/generator.py` talks to it with the standard `openai` SDK, just pointed
+at `OLLAMA_URL` (`config.py`) instead of `api.openai.com` — no API key or
+external network call required. Change `OLLAMA_MODEL` in `.env` to use a
+different pulled model (see
+[Setup → Switching the Ollama model](../setup.md#switching-the-ollama-model)).
+
 ## System prompt template
 
 ```text
@@ -34,7 +45,7 @@ Pertanyaan: <user's question>
 `{"role": ..., "content": ...}` dicts already loaded from PostgreSQL by
 [`rag/pipeline.py`](pipeline.md) (the last `CONVERSATION_HISTORY_LIMIT`
 messages, default 10, oldest first). These are inserted as prior turns
-between the system prompt and the current question, so GPT-4o-mini sees the
+between the system prompt and the current question, so the model sees the
 conversation in order:
 
 ```
@@ -57,6 +68,6 @@ respond with the fixed fallback message rather than guessing:
 > "Maaf, tidak ditemukan informasi yang relevan untuk menjawab pertanyaan
 > ini."
 
-If the OpenAI API call itself fails (network error, rate limit, etc.), the
-exception is caught and logged, and a generic Indonesian error message is
-returned instead of raising and crashing the chat session.
+If the LLM call itself fails (Ollama not running, model not pulled, network
+error, etc.), the exception is caught and logged, and a generic Indonesian
+error message is returned instead of raising and crashing the chat session.

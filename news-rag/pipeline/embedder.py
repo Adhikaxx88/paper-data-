@@ -1,4 +1,4 @@
-"""Embed chunks with OpenAI and store vectors in Qdrant, text in PostgreSQL."""
+"""Embed chunks with a local BGE model (via infinity-emb) and store vectors in Qdrant, text in PostgreSQL."""
 import json
 import os
 import uuid
@@ -8,34 +8,42 @@ from typing import Any, Optional
 from loguru import logger
 from openai import OpenAI
 
-from config import DATA_CHUNKS_DIR, EMBEDDING_MODEL, OPENAI_API_KEY
+from config import DATA_CHUNKS_DIR, EMBED_MODEL, INFINITY_URL
 from db import postgres, qdrant_client
+
+# BGE models expect an instruction prefix for best retrieval quality: one
+# form for indexed passages, a different one for search queries (used in
+# rag/retriever.py). See https://huggingface.co/BAAI/bge-large-en-v1.5
+PASSAGE_PREFIX = "Represent this sentence for searching relevant passages: "
 
 _client: Optional[OpenAI] = None
 
 
-def get_openai_client() -> OpenAI:
-    """Return a lazily-initialized, module-level OpenAI client.
+def get_embedding_client() -> OpenAI:
+    """Return a lazily-initialized, module-level client for the infinity-emb server.
+
+    infinity-emb exposes an OpenAI-compatible /embeddings endpoint, so the
+    OpenAI SDK is reused here pointed at a local base_url instead of OpenAI's API.
 
     Returns:
-        A configured OpenAI client instance.
+        A configured OpenAI client instance targeting infinity-emb.
     """
     global _client
     if _client is None:
-        _client = OpenAI(api_key=OPENAI_API_KEY)
+        _client = OpenAI(base_url=INFINITY_URL, api_key="dummy")
     return _client
 
 
 def embed_text(text: str) -> list[float]:
-    """Embed a single string using the configured OpenAI embedding model.
+    """Embed a single string using the configured BGE model, as-is (no prefix).
 
     Args:
-        text: Text to embed.
+        text: Text to embed, already prefixed by the caller if needed.
 
     Returns:
         The embedding vector.
     """
-    response = get_openai_client().embeddings.create(model=EMBEDDING_MODEL, input=text)
+    response = get_embedding_client().embeddings.create(model=EMBED_MODEL, input=text)
     return response.data[0].embedding
 
 
@@ -81,7 +89,7 @@ def index_chunk(chunk: dict[str, Any]) -> bool:
     )
     postgres.insert_chunk(chunk_id, article_id, chunk["chunk_index"], chunk["chunk_text"])
 
-    vector = embed_text(chunk["chunk_text"])
+    vector = embed_text(PASSAGE_PREFIX + chunk["chunk_text"])
     qdrant_client.upsert_point(
         chunk_id,
         vector,

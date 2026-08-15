@@ -5,10 +5,14 @@
 ## Step-by-step: query → embed → search → fetch
 
 1. **Embed the query.** The user's question is embedded with the exact same
-   model used to embed chunks at indexing time
-   (`text-embedding-3-small`, via `pipeline.embedder.embed_text`). Using a
-   different model here would make the query vector incomparable to the
-   stored chunk vectors.
+   model used to embed chunks at indexing time (`EMBED_MODEL`, default
+   `BAAI/bge-large-en-v1.5` via infinity-emb), reusing
+   `pipeline.embedder.embed_text`. Using a different model here would make
+   the query vector incomparable to the stored chunk vectors. Because BGE
+   uses different instruction prefixes for queries vs. passages, the query
+   text is prefixed with `QUERY_PREFIX` ("Represent this question for
+   searching relevant passages: ") before embedding — a different prefix
+   than the `PASSAGE_PREFIX` used in the [embedder](../pipeline/embedder.md).
 2. **Search Qdrant.** `db.qdrant_client.search(query_vector, top_k)` runs a
    cosine-similarity nearest-neighbor search over the `news_chunks`
    collection and returns the top-K `chunk_id`s with their scores.
