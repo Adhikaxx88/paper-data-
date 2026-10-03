@@ -1,10 +1,10 @@
-"""Generate chatbot answers from retrieved context and conversation history using a local Ollama model."""
+"""Generate chatbot answers from retrieved context and conversation history via OpenRouter."""
 from typing import Any, Optional
 
 from loguru import logger
 from openai import OpenAI
 
-from config import OLLAMA_MODEL, OLLAMA_URL
+from config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, RAG_GENERATOR_MODEL, RAG_GENERATOR_PROVIDER, provider_body
 
 SYSTEM_PROMPT = """Anda adalah asisten berita yang menjawab pertanyaan HANYA berdasarkan konteks \
 berita yang diberikan di bawah ini. Jangan menggunakan pengetahuan di luar konteks.
@@ -20,17 +20,14 @@ _client: Optional[OpenAI] = None
 
 
 def get_llm_client() -> OpenAI:
-    """Return a lazily-initialized, module-level client for the local Ollama server.
-
-    Ollama exposes an OpenAI-compatible /v1/chat/completions endpoint, so the
-    OpenAI SDK is reused here pointed at a local base_url instead of OpenAI's API.
+    """Return a lazily-initialized, module-level OpenAI-compatible client for OpenRouter.
 
     Returns:
-        A configured OpenAI client instance targeting Ollama.
+        A configured OpenAI client whose base_url points at OpenRouter.
     """
     global _client
     if _client is None:
-        _client = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
+        _client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
     return _client
 
 
@@ -79,7 +76,7 @@ def build_messages(
 
 
 def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[dict[str, str]]) -> str:
-    """Call the local Ollama model to produce an answer grounded in the retrieved context.
+    """Call the RAG generator model on OpenRouter to produce an answer grounded in the retrieved context.
 
     Args:
         question: The current user question.
@@ -92,9 +89,10 @@ def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[d
     messages = build_messages(question, chunks, history)
     try:
         response = get_llm_client().chat.completions.create(
-            model=OLLAMA_MODEL,
+            model=RAG_GENERATOR_MODEL,
             messages=messages,
             temperature=0.2,
+            extra_body=provider_body(RAG_GENERATOR_PROVIDER),
         )
         return response.choices[0].message.content or ""
     except Exception as e:

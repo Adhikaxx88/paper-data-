@@ -1031,11 +1031,6 @@ def provider_body(provider_slug: str) -> dict:
         return {}
     return {"provider": {"order": [provider_slug], "allow_fallbacks": False}}
 
-# Legacy name still imported by an unchanged HEAD module (rag/generator.py).
-# Removed in the commit that migrates rag/generator.py.
-OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://ollama:11434/v1")
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
-
 QDRANT_COLLECTION: str = os.getenv("COLLECTION_NAME", "data-paper-child")
 
 CHUNK_SIZE_TOKENS: int = 500
