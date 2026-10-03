@@ -1,53 +1,86 @@
-"""Retrieve relevant news chunks for a user query via Qdrant + PostgreSQL."""
-import uuid
-from typing import Any
+"""Retrieve relevant news chunks for a user query via hybrid (dense + BM25) Qdrant search."""
+import hashlib
+from typing import Any, Optional
 
 from loguru import logger
+from qdrant_client.models import Filter, FieldCondition, Fusion, FusionQuery, MatchValue, Prefetch, SparseVector
 
-from config import RETRIEVAL_TOP_K
-from db import postgres, qdrant_client
-from pipeline.embedder import embed_text
-
-# BGE models expect a different instruction prefix for search queries than
-# for indexed passages (see pipeline/embedder.py's PASSAGE_PREFIX).
-QUERY_PREFIX = "Represent this question for searching relevant passages: "
+from config import QDRANT_COLLECTION, RETRIEVAL_TOP_K
+from vectorization.embedder import encode_query, encode_sparse
+from vectorization.qdrant_store import DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME, get_client
 
 
-def retrieve(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict[str, Any]]:
-    """Embed a query, search Qdrant, and fetch matching chunk text from PostgreSQL.
+def _hash_article_id(article_id: Any) -> str:
+    """MD5-hash an article id so the raw UUID is never exposed to clients.
+
+    Args:
+        article_id: The article's UUID (or string form) from the chunk payload.
+
+    Returns:
+        Hex-encoded MD5 digest of the article id.
+    """
+    return hashlib.md5(str(article_id).encode("utf-8")).hexdigest()
+
+
+def retrieve(query: str, top_k: int = RETRIEVAL_TOP_K, category: Optional[str] = None) -> list[dict[str, Any]]:
+    """Hybrid search: dense (BGE) + sparse (BM25) prefetch fused via RRF.
+
+    chunk_text and article metadata are read directly from the Qdrant
+    payload, so no PostgreSQL lookup is needed at retrieval time.
 
     Args:
         query: The user's natural-language question.
-        top_k: Number of nearest chunks to retrieve.
+        top_k: Number of results to return after fusion.
+        category: Optional exact-match filter on the article's category.
 
     Returns:
-        List of dicts with chunk_text, title, source, date, category, url, and score,
-        ordered by descending similarity score.
+        List of dicts with chunk_text, title, source, date, category, url, score,
+        and article_id (MD5-hashed), ordered by descending fused score.
     """
-    query_vector = embed_text(QUERY_PREFIX + query)
-    hits = qdrant_client.search(query_vector, top_k)
-    if not hits:
+    client = get_client()
+    dense_query = encode_query(query)
+    sparse_query = encode_sparse([query])[0]
+
+    query_filter = None
+    if category:
+        query_filter = Filter(must=[FieldCondition(key="category", match=MatchValue(value=category))])
+
+    results = client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        prefetch=[
+            Prefetch(query=dense_query, using=DENSE_VECTOR_NAME, limit=top_k * 2),
+            Prefetch(
+                query=SparseVector(
+                    indices=sparse_query.indices.tolist(),
+                    values=sparse_query.values.tolist(),
+                ),
+                using=SPARSE_VECTOR_NAME,
+                limit=top_k * 2,
+            ),
+        ],
+        query=FusionQuery(fusion=Fusion.RRF),
+        query_filter=query_filter,
+        limit=top_k,
+        with_payload=True,
+    )
+
+    if not results.points:
         logger.info(f"No Qdrant hits for query: {query!r}")
         return []
 
-    scores_by_chunk_id = {uuid.UUID(hit["chunk_id"]): hit["score"] for hit in hits}
-    chunk_ids = list(scores_by_chunk_id.keys())
-    rows = postgres.get_chunks_by_ids(chunk_ids)
-
-    results = [
+    return [
         {
-            "chunk_text": row["chunk_text"],
-            "title": row["title"],
-            "source": row["source"],
-            "date": row["date"],
-            "category": row["category"],
-            "url": row["url"],
-            "score": scores_by_chunk_id.get(row["chunk_id"], 0.0),
+            "chunk_text": point.payload.get("chunk_text"),
+            "title": point.payload.get("title"),
+            "source": point.payload.get("source"),
+            "date": point.payload.get("date"),
+            "category": point.payload.get("category"),
+            "url": point.payload.get("url"),
+            "score": point.score,
+            "article_id": _hash_article_id(point.payload.get("article_id")),
         }
-        for row in rows
+        for point in results.points
     ]
-    results.sort(key=lambda r: r["score"], reverse=True)
-    return results
 
 
 if __name__ == "__main__":
