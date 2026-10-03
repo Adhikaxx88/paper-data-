@@ -1,38 +1,41 @@
-import type { ChatResponse, Message } from '../types'
-
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
-async function handleResponse<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    let detail = response.statusText
-    try {
-      const body = await response.json()
-      detail = body.detail ?? detail
-    } catch {
-      // response body wasn't JSON; fall back to statusText
-    }
-    throw new Error(detail)
+export interface SourceItem {
+  title: string
+  source: string
+  date: string
+  score: number
+  url?: string
+  article_id: string
+}
+
+export interface ChatResponse {
+  answer: string
+  sources: SourceItem[]
+}
+
+async function parseErrorDetail(response: Response): Promise<string> {
+  try {
+    const body = await response.json()
+    return body.detail ?? response.statusText
+  } catch {
+    return response.statusText
   }
-  return response.json() as Promise<T>
 }
 
 export async function createSession(): Promise<string> {
   const response = await fetch(`${BASE}/api/session`, { method: 'POST' })
-  const data = await handleResponse<{ session_id: string }>(response)
-  return data.session_id
+  if (!response.ok) throw new Error(await parseErrorDetail(response))
+  const body = (await response.json()) as { session_id: string }
+  return body.session_id
 }
 
-export async function sendMessage(session_id: string, message: string): Promise<ChatResponse> {
+export async function sendChatMessage(sessionId: string, message: string): Promise<ChatResponse> {
   const response = await fetch(`${BASE}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ session_id, message }),
+    body: JSON.stringify({ session_id: sessionId, message }),
   })
-  return handleResponse<ChatResponse>(response)
-}
-
-export async function getHistory(session_id: string): Promise<Message[]> {
-  const response = await fetch(`${BASE}/api/history/${session_id}`)
-  const data = await handleResponse<{ messages: Message[] }>(response)
-  return data.messages
+  if (!response.ok) throw new Error(await parseErrorDetail(response))
+  return response.json() as Promise<ChatResponse>
 }

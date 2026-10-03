@@ -1,28 +1,82 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 html,
 body,
 #root {
   height: 100%;
 }
 
-body {
-  margin: 0;
+:root {
+  --bg-page: #f6f8fa;
+  --bg-content: #ffffff;
+  --border: rgba(0, 0, 0, 0.1);
+  --border-subtle: rgba(0, 0, 0, 0.06);
+  --border-strong: rgba(0, 0, 0, 0.12);
+  --hover-bg: rgba(0, 0, 0, 0.05);
+  --header-border: rgba(0, 0, 0, 0.08);
+  --header-overlay: rgba(0, 0, 0, 0.02);
+  --bubble-bg: rgba(0, 0, 0, 0.05);
+  --accent-bar: rgba(0, 0, 0, 0.15);
+  --loading-dot: #6e7681;
 }
 
-@keyframes bounce-dot {
+.dark {
+  --bg-page: #0d1117;
+  --bg-content: #161b22;
+  --border: rgba(255, 255, 255, 0.15);
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --hover-bg: rgba(255, 255, 255, 0.05);
+  --header-border: rgba(255, 255, 255, 0.08);
+  --header-overlay: rgba(255, 255, 255, 0.02);
+  --bubble-bg: rgba(255, 255, 255, 0.05);
+  --accent-bar: rgba(255, 255, 255, 0.15);
+  --loading-dot: rgba(255, 255, 255, 0.5);
+  color-scheme: dark;
+}
+
+html,
+body {
+  /* The App root div also sets this, but without it here the browser's own
+     UA background (pure black under a dark color-scheme) shows through
+     during overscroll/rubber-banding or before React mounts. */
+  background-color: var(--bg-page);
+}
+
+body {
+  margin: 0;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    'Inter',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Shared tiny-caps label style: empty-state eyebrow, "Sources" heading. */
+.label-tiny {
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.4;
+}
+
+@keyframes pulse-dot {
   0%,
-  80%,
   100% {
-    transform: translateY(0);
-    opacity: 0.5;
+    opacity: 0.3;
   }
-  40% {
-    transform: translateY(-4px);
+  50% {
     opacity: 1;
   }
 }
 
-.animate-bounce-dot {
-  animation: bounce-dot 1.2s infinite ease-in-out;
+.loading-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background-color: var(--loading-dot);
+  animation: pulse-dot 1.2s ease-in-out infinite;
 }
