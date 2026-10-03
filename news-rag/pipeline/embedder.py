@@ -1,50 +1,16 @@
-"""Embed chunks with a local BGE model (via infinity-emb) and store vectors in Qdrant, text in PostgreSQL."""
+"""Embed chunks natively (BGE dense + BM25 sparse) and store vectors+text in Qdrant, text in PostgreSQL."""
 import json
 import os
 import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Optional
 
 from loguru import logger
-from openai import OpenAI
 
-from config import DATA_CHUNKS_DIR, EMBED_MODEL, INFINITY_URL
-from db import postgres, qdrant_client
-
-# BGE models expect an instruction prefix for best retrieval quality: one
-# form for indexed passages, a different one for search queries (used in
-# rag/retriever.py). See https://huggingface.co/BAAI/bge-large-en-v1.5
-PASSAGE_PREFIX = "Represent this sentence for searching relevant passages: "
-
-_client: Optional[OpenAI] = None
-
-
-def get_embedding_client() -> OpenAI:
-    """Return a lazily-initialized, module-level client for the infinity-emb server.
-
-    infinity-emb exposes an OpenAI-compatible /embeddings endpoint, so the
-    OpenAI SDK is reused here pointed at a local base_url instead of OpenAI's API.
-
-    Returns:
-        A configured OpenAI client instance targeting infinity-emb.
-    """
-    global _client
-    if _client is None:
-        _client = OpenAI(base_url=INFINITY_URL, api_key="dummy")
-    return _client
-
-
-def embed_text(text: str) -> list[float]:
-    """Embed a single string using the configured BGE model, as-is (no prefix).
-
-    Args:
-        text: Text to embed, already prefixed by the caller if needed.
-
-    Returns:
-        The embedding vector.
-    """
-    response = get_embedding_client().embeddings.create(model=EMBED_MODEL, input=text)
-    return response.data[0].embedding
+from config import DATA_CHUNKS_DIR
+from db import postgres
+from vectorization.embedder import encode_passage, encode_sparse
+from vectorization.qdrant_store import init_collection, point_exists, upsert_chunks
 
 
 def _parse_date(raw_date: Optional[str]) -> Optional[date]:
@@ -64,21 +30,17 @@ def _parse_date(raw_date: Optional[str]) -> Optional[date]:
         return None
 
 
-def index_chunk(chunk: dict[str, Any]) -> bool:
-    """Embed and store a single chunk, skipping it if already indexed.
+def _store_in_postgres(chunk: dict[str, Any]) -> None:
+    """Persist a chunk's text and parent article metadata in PostgreSQL.
+
+    PostgreSQL is used for chat history and metadata lookup only — retrieval
+    reads chunk_text directly from the Qdrant payload instead.
 
     Args:
         chunk: Chunk dict as produced by pipeline.chunker.
-
-    Returns:
-        True if the chunk was newly indexed, False if it was already present.
     """
-    chunk_id = uuid.UUID(chunk["chunk_id"])
-    article_id = uuid.UUID(chunk["article_id"])
-
-    if postgres.chunk_exists(chunk_id) and qdrant_client.point_exists(chunk_id):
-        return False
-
+    article_id = chunk["article_id"]
+    chunk_id = chunk["chunk_id"]
     postgres.upsert_article(
         source=chunk["source"],
         title=chunk["title"],
@@ -87,22 +49,51 @@ def index_chunk(chunk: dict[str, Any]) -> bool:
         category=chunk["category"],
         article_id=article_id,
     )
-    postgres.insert_chunk(chunk_id, article_id, chunk["chunk_index"], chunk["chunk_text"])
-
-    vector = embed_text(PASSAGE_PREFIX + chunk["chunk_text"])
-    qdrant_client.upsert_point(
+    postgres.insert_chunk(
         chunk_id,
-        vector,
-        payload={
-            "chunk_id": str(chunk_id),
-            "article_id": str(article_id),
-            "title": chunk["title"],
-            "source": chunk["source"],
-            "date": chunk["date"],
-            "category": chunk["category"],
-        },
+        article_id,
+        chunk["chunk_index"],
+        chunk["chunk_text"],
+        keyword=chunk.get("keyword"),
     )
-    return True
+
+
+def embed_and_store(chunks: list[dict[str, Any]]) -> dict[str, int]:
+    """Embed a batch of chunks and store them in Qdrant (vectors + text) and PostgreSQL.
+
+    Skips chunks already indexed in Qdrant so re-running the pipeline is safe.
+
+    Args:
+        chunks: Chunk dicts as produced by pipeline.chunker.
+
+    Returns:
+        Summary dict with counts of processed, indexed, and skipped chunks.
+    """
+    init_collection()
+
+    new_chunks = [c for c in chunks if not point_exists(uuid.UUID(c["chunk_id"]))]
+    skipped = len(chunks) - len(new_chunks)
+
+    if new_chunks:
+        total = len(new_chunks)
+        for i, chunk in enumerate(new_chunks, start=1):
+            preview = chunk["chunk_text"][:50].replace("\n", " ")
+            logger.info(
+                f"Embedding chunk {i}/{total} (article_id={chunk['article_id']}): {preview!r}"
+            )
+
+        texts = [c["chunk_text"] for c in new_chunks]
+        dense_vecs = encode_passage(texts)
+        sparse_vecs = encode_sparse(texts)
+        upsert_chunks(new_chunks, dense_vecs, sparse_vecs)
+
+        for chunk in new_chunks:
+            try:
+                _store_in_postgres(chunk)
+            except Exception as e:
+                logger.error(f"Failed to store chunk {chunk.get('chunk_id')} in PostgreSQL: {e}")
+
+    return {"processed": len(chunks), "indexed": len(new_chunks), "skipped": skipped}
 
 
 def run(chunks_file: Optional[str] = None) -> dict[str, int]:
@@ -116,7 +107,7 @@ def run(chunks_file: Optional[str] = None) -> dict[str, int]:
         Summary dict with counts of processed, indexed, and skipped chunks.
     """
     postgres.init_schema()
-    qdrant_client.init_collection()
+    init_collection()
 
     files = (
         [chunks_file]
@@ -124,9 +115,7 @@ def run(chunks_file: Optional[str] = None) -> dict[str, int]:
         else [os.path.join(DATA_CHUNKS_DIR, f) for f in os.listdir(DATA_CHUNKS_DIR) if f.endswith(".json")]
     )
 
-    indexed = 0
-    skipped = 0
-    processed = 0
+    totals = {"processed": 0, "indexed": 0, "skipped": 0}
 
     for path in files:
         try:
@@ -136,18 +125,20 @@ def run(chunks_file: Optional[str] = None) -> dict[str, int]:
             logger.error(f"Failed to read chunks file {path}: {e}")
             continue
 
-        for chunk in chunks:
-            processed += 1
-            try:
-                if index_chunk(chunk):
-                    indexed += 1
-                else:
-                    skipped += 1
-            except Exception as e:
-                logger.error(f"Failed to index chunk {chunk.get('chunk_id')}: {e}")
+        try:
+            result = embed_and_store(chunks)
+        except Exception as e:
+            logger.error(f"Failed to embed chunks file {path}: {e}")
+            continue
 
-    logger.info(f"Embedding complete: {processed} processed, {indexed} indexed, {skipped} already indexed")
-    return {"processed": processed, "indexed": indexed, "skipped": skipped}
+        for key in totals:
+            totals[key] += result[key]
+
+    logger.info(
+        f"Embedding complete: {totals['processed']} processed, "
+        f"{totals['indexed']} indexed, {totals['skipped']} already indexed"
+    )
+    return totals
 
 
 if __name__ == "__main__":

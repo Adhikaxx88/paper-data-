@@ -1,139 +1,128 @@
-"""Clean raw scraped articles: strip markup, normalize dates, filter short content."""
-import json
-import os
+"""Clean raw_articles rows in PostgreSQL and insert the results into clean_articles."""
 import re
-from datetime import datetime
-from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 
 from loguru import logger
 
-from config import DATA_CLEAN_DIR, DATA_RAW_DIR, MIN_CONTENT_LENGTH
+from config import MIN_CONTENT_LENGTH
+from db.postgres import get_connection, get_uncleaned_raw_articles, insert_clean_article, url_exists_in_clean
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SPECIAL_CHARS_RE = re.compile(r"[^\w\s.,!?%\-À-ɏ]")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
-def strip_html(text: str) -> str:
-    """Remove HTML tags from text.
-
-    Args:
-        text: Raw text possibly containing HTML markup.
-
-    Returns:
-        Text with tags removed.
-    """
-    return _HTML_TAG_RE.sub(" ", text)
-
-
-def normalize_text(text: str) -> str:
+def _normalize_text(text: str) -> str:
     """Strip HTML, remove special characters, and collapse whitespace.
 
     Args:
-        text: Raw article text.
+        text: Raw text.
 
     Returns:
         Cleaned, whitespace-normalized text.
     """
-    text = strip_html(text)
+    text = _HTML_TAG_RE.sub(" ", text)
     text = _SPECIAL_CHARS_RE.sub(" ", text)
     text = _WHITESPACE_RE.sub(" ", text).strip()
     return text
 
 
-def normalize_date(raw_date: str) -> Optional[str]:
-    """Convert a Google News RFC-822 date string to ISO 8601 (YYYY-MM-DD).
+def _is_indonesia_relevant(article: dict) -> bool:
+    """Check whether an article's title, url, or content mentions Indonesia.
 
     Args:
-        raw_date: Date string as returned by the scraper (e.g. "Wed, 15 Aug 2026 09:00:00 GMT").
+        article: A dict with title, url, and content fields.
 
     Returns:
-        ISO date string, or None if the date could not be parsed.
+        True if "indonesia" (case-insensitive) appears in any of those fields.
     """
-    if not raw_date:
+    title = article.get("title") or ""
+    url = article.get("url") or ""
+    content = article.get("content") or ""
+    return "indonesia" in title.lower() or "indonesia" in url.lower() or "indonesia" in content.lower()
+
+
+def _clean_article(article: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Apply cleaning rules to a raw_articles row.
+
+    Rules: title, url, and content must be present and non-empty; content
+    must be at least MIN_CONTENT_LENGTH characters after normalization;
+    whitespace and HTML markup are stripped from text fields.
+
+    Args:
+        article: A raw_articles row (dict) as returned by get_uncleaned_raw_articles.
+
+    Returns:
+        A clean_articles-ready dict, or None if the article doesn't pass the rules.
+    """
+    title = article.get("title") or ""
+    url = article.get("url") or ""
+    raw_content = article.get("content") or ""
+    if not title.strip() or not url.strip() or not raw_content.strip():
         return None
-    try:
-        return parsedate_to_datetime(raw_date).date().isoformat()
-    except (TypeError, ValueError):
-        try:
-            return datetime.fromisoformat(raw_date).date().isoformat()
-        except ValueError:
-            logger.warning(f"Could not parse date: {raw_date}")
-            return None
 
-
-def clean_article(article: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Clean a single article record.
-
-    Args:
-        article: Raw article dict with source, title, content, date, url, category.
-
-    Returns:
-        Cleaned article dict, or None if it fails the minimum content length filter.
-    """
-    content = normalize_text(article.get("content", ""))
+    content = _normalize_text(raw_content)
     if len(content) < MIN_CONTENT_LENGTH:
         return None
 
     return {
-        "source": normalize_text(article.get("source", "")),
-        "title": normalize_text(article.get("title", "")),
+        "raw_id": article["id"],
+        "url": url,
+        "title": _normalize_text(title),
         "content": content,
-        "date": normalize_date(article.get("date", "")),
-        "url": article.get("url", ""),
-        "category": article.get("category", ""),
+        "published": article.get("published"),
+        "source": _normalize_text(article.get("source") or ""),
+        "topic_category": article.get("topic_category"),
+        "sub_area": article.get("sub_area"),
+        "keyword": article.get("keyword"),
+        "language": article.get("language", "en"),
     }
 
 
-def run(raw_file: Optional[str] = None) -> str:
-    """Clean raw article files and save deduplicated results to data/clean/.
+def clean_and_store() -> dict[str, int]:
+    """Clean every not-yet-cleaned raw_articles row and insert it into clean_articles.
 
-    Args:
-        raw_file: Optional specific raw JSON file to process. Defaults to
-            processing every file in data/raw/.
+    Skips articles whose URL already exists in clean_articles (duplicate detection).
 
     Returns:
-        Path to the written cleaned JSON file.
+        Summary dict: processed, inserted, skipped, duplicates.
     """
-    os.makedirs(DATA_CLEAN_DIR, exist_ok=True)
-    files = (
-        [raw_file]
-        if raw_file
-        else [os.path.join(DATA_RAW_DIR, f) for f in os.listdir(DATA_RAW_DIR) if f.endswith(".json")]
-    )
+    conn = get_connection()
+    try:
+        raw_articles = get_uncleaned_raw_articles(conn)
 
-    seen_urls: set[str] = set()
-    cleaned: list[dict[str, Any]] = []
-    dropped = 0
-
-    for path in files:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                articles = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Failed to read raw file {path}: {e}")
-            continue
-
-        for article in articles:
-            url = article.get("url", "")
-            if not url or url in seen_urls:
+        processed, inserted, skipped, duplicates, skipped_not_indonesia = 0, 0, 0, 0, 0
+        for article in raw_articles:
+            processed += 1
+            cleaned = _clean_article(article)
+            if cleaned is None:
+                skipped += 1
                 continue
-            result = clean_article(article)
-            if result is None:
-                dropped += 1
+
+            if not _is_indonesia_relevant(cleaned):
+                skipped_not_indonesia += 1
                 continue
-            seen_urls.add(url)
-            cleaned.append(result)
 
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    out_path = os.path.join(DATA_CLEAN_DIR, f"clean_{timestamp}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(cleaned, f, ensure_ascii=False, indent=2)
+            if url_exists_in_clean(conn, cleaned["url"]):
+                logger.debug(f"Duplicate skipped: {cleaned['url']}")
+                duplicates += 1
+                continue
 
-    logger.info(f"Cleaned {len(cleaned)} articles ({dropped} dropped as too short) -> {out_path}")
-    return out_path
+            result = insert_clean_article(conn, cleaned)
+            inserted += 1 if result else 0
+    finally:
+        conn.close()
+
+    summary = {
+        "processed": processed,
+        "inserted": inserted,
+        "skipped": skipped,
+        "duplicates": duplicates,
+        "skipped_not_indonesia": skipped_not_indonesia,
+    }
+    logger.info(f"Clean complete: {summary}")
+    return summary
 
 
 if __name__ == "__main__":
-    run()
+    clean_and_store()

@@ -1,30 +1,21 @@
-"""Export cleaned articles to PDF, organize by category, and back them up to Google Drive."""
-import json
+"""Export clean_articles to PDF, organized by language/topic_category/sub_area."""
 import os
 import re
-import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 from fpdf import FPDF
-from googleapiclient.discovery import Resource, build
-from googleapiclient.http import MediaFileUpload
-from google.oauth2 import service_account
 from loguru import logger
 
-from config import DATA_CLEAN_DIR, DATA_PDF_DIR, GOOGLE_DRIVE_CREDENTIALS_PATH
-from db import postgres
-from pipeline.chunker import derive_article_id
-
-_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-_drive_service: Optional[Resource] = None
-_folder_cache: dict[str, str] = {}
+from config import DATA_PDF_DIR
+from db.postgres import get_articles_without_drive_url, get_connection
 
 
 def slugify(text: str) -> str:
-    """Convert a title into a filesystem-safe slug.
+    """Convert text into a filesystem-safe slug.
 
     Args:
-        text: Arbitrary text, typically an article title.
+        text: Arbitrary text, typically an article title or category.
 
     Returns:
         Lowercase slug with only alphanumerics and hyphens.
@@ -33,155 +24,116 @@ def slugify(text: str) -> str:
     return slug[:80] or "untitled"
 
 
-def article_to_pdf(article: dict[str, Any], out_path: str) -> None:
-    """Render a single article as a PDF file.
+def _create_pdf(article: dict[str, Any], subfolder: Optional[str] = None, output_dir: str = DATA_PDF_DIR) -> Path:
+    """Render a clean_articles row as a PDF file under output_dir, organized as
+    topic_category/sub_area/filename.pdf.
+
+    Uses a Unicode TTF font when the DejaVu fonts are available on the
+    system (common on Linux), falling back to the latin-1-only core
+    Helvetica font (with unsupported characters replaced) otherwise.
 
     Args:
-        article: Cleaned article dict with title, source, date, url, content.
-        out_path: Destination path for the generated PDF.
+        article: Clean article dict with id, title, source, published, url, content, topic_category.
+        subfolder: Optional sub_area name to nest the PDF under (in addition to topic_category).
+        output_dir: Root directory to write the PDF under. Defaults to DATA_PDF_DIR.
+
+    Returns:
+        Path to the generated PDF file.
     """
+    category_dir = Path(output_dir) / slugify(article.get("language") or "en")
+    category_dir = category_dir / slugify(article.get("topic_category") or "uncategorized")
+    if subfolder:
+        category_dir = category_dir / slugify(subfolder)
+    category_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = category_dir / f"{slugify(article['title'])}-{str(article['id'])[:8]}.pdf"
+
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.multi_cell(0, 10, article["title"])
-    pdf.set_font("Helvetica", "", 10)
-    pdf.multi_cell(0, 6, f"Source: {article['source']} | Date: {article['date']} | URL: {article['url']}")
+
+    unicode_font = _register_unicode_font(pdf)
+    title_style = (unicode_font, "B", 16) if unicode_font else ("Helvetica", "B", 16)
+    meta_style = (unicode_font, "", 10) if unicode_font else ("Helvetica", "", 10)
+    body_style = (unicode_font, "", 11) if unicode_font else ("Helvetica", "", 11)
+
+    def text(value: Any) -> str:
+        s = str(value or "")
+        return s if unicode_font else s.encode("latin-1", "replace").decode("latin-1")
+
+    pdf.set_font(*title_style)
+    pdf.multi_cell(0, 10, text(article.get("title")))
+    pdf.ln(2)
+
+    pdf.set_font(*meta_style)
+    pdf.multi_cell(
+        0,
+        6,
+        text(
+            f"Source: {article.get('source')} | Published: {article.get('published')} | "
+            f"URL: {article.get('url')}"
+        ),
+    )
     pdf.ln(4)
-    pdf.set_font("Helvetica", "", 11)
-    pdf.multi_cell(0, 6, article["content"])
-    pdf.output(out_path)
+
+    pdf.set_font(*body_style)
+    pdf.multi_cell(0, 6, text(article.get("content")))
+
+    pdf.output(str(pdf_path))
+    return pdf_path
 
 
-def get_drive_service() -> Resource:
-    """Return a lazily-initialized, module-level Google Drive API client.
+def _register_unicode_font(pdf: FPDF) -> Optional[str]:
+    """Register the DejaVu Sans TTF font with fpdf2 if it's installed on the system.
 
     Returns:
-        An authenticated Drive v3 service resource.
+        "DejaVu" if the font was registered, otherwise None (caller should
+        fall back to the latin-1-only core Helvetica font).
     """
-    global _drive_service
-    if _drive_service is None:
-        credentials = service_account.Credentials.from_service_account_file(
-            GOOGLE_DRIVE_CREDENTIALS_PATH, scopes=_DRIVE_SCOPES
-        )
-        _drive_service = build("drive", "v3", credentials=credentials)
-    return _drive_service
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            pdf.add_font("DejaVu", "", path)
+            pdf.add_font("DejaVu", "B", path)
+            return "DejaVu"
+    return None
 
 
-def get_or_create_folder(category: str) -> str:
-    """Find or create a Google Drive folder for a category, caching the result.
+def export_and_upload(output_dir: Optional[str] = None, since_date: Optional[str] = None) -> dict[str, int]:
+    """Export clean_articles rows without a drive_url to PDF, organized under
+    output_dir by language/topic_category/sub_area.
 
     Args:
-        category: Article category, used as the folder name.
+        output_dir: Optional root directory to write PDFs under. Defaults to DATA_PDF_DIR.
+        since_date: Optional ISO date string (e.g. '2026-08-30'). If provided, only
+            articles created on or after this date are exported.
 
     Returns:
-        The Drive folder id.
+        Summary dict: exported, failed.
     """
-    if category in _folder_cache:
-        return _folder_cache[category]
+    target_dir = output_dir or DATA_PDF_DIR
+    os.makedirs(target_dir, exist_ok=True)
 
-    service = get_drive_service()
-    query = (
-        f"name = '{category}' and mimeType = 'application/vnd.google-apps.folder' "
-        "and trashed = false"
-    )
-    results = service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get("files", [])
-    if files:
-        folder_id = files[0]["id"]
-    else:
-        metadata = {"name": category, "mimeType": "application/vnd.google-apps.folder"}
-        folder = service.files().create(body=metadata, fields="id").execute()
-        folder_id = folder["id"]
-
-    _folder_cache[category] = folder_id
-    return folder_id
-
-
-def upload_to_drive(local_path: str, category: str) -> str:
-    """Upload a PDF to the category's Drive folder and return its shareable link.
-
-    Args:
-        local_path: Path to the local PDF file.
-        category: Article category, used to pick the destination folder.
-
-    Returns:
-        The uploaded file's webViewLink.
-    """
-    service = get_drive_service()
-    folder_id = get_or_create_folder(category)
-    metadata = {"name": os.path.basename(local_path), "parents": [folder_id]}
-    media = MediaFileUpload(local_path, mimetype="application/pdf")
-    uploaded = service.files().create(body=metadata, media_body=media, fields="id, webViewLink").execute()
-    return uploaded["webViewLink"]
-
-
-def export_article(article: dict[str, Any]) -> Optional[str]:
-    """Render, save, and upload the PDF for a single article, then update PostgreSQL.
-
-    Skips articles whose PDF has already been uploaded (drive_url already set).
-
-    Args:
-        article: Cleaned article dict.
-
-    Returns:
-        The Drive URL if newly uploaded, otherwise None.
-    """
-    article_id = derive_article_id(article["url"])
-    if postgres.has_drive_url(article_id):
-        return None
-
-    category_dir = os.path.join(DATA_PDF_DIR, slugify(article["category"]))
-    os.makedirs(category_dir, exist_ok=True)
-    pdf_path = os.path.join(category_dir, f"{slugify(article['title'])}.pdf")
-
-    if not os.path.exists(pdf_path):
-        article_to_pdf(article, pdf_path)
-
+    conn = get_connection()
     try:
-        drive_url = upload_to_drive(pdf_path, article["category"])
-    except Exception as e:
-        logger.error(f"Failed to upload PDF for '{article['title'][:50]}' to Drive: {e}")
-        return None
+        articles = get_articles_without_drive_url(conn, since_date=since_date)
 
-    postgres.update_drive_url(article_id, drive_url)
-    return drive_url
-
-
-def run(clean_file: Optional[str] = None) -> dict[str, int]:
-    """Export all (or one) cleaned article file(s) to PDF and upload to Drive.
-
-    Args:
-        clean_file: Optional specific cleaned JSON file to process. Defaults to
-            processing every file in data/clean/.
-
-    Returns:
-        Summary dict with counts of processed and uploaded articles.
-    """
-    os.makedirs(DATA_PDF_DIR, exist_ok=True)
-    files = (
-        [clean_file]
-        if clean_file
-        else [os.path.join(DATA_CLEAN_DIR, f) for f in os.listdir(DATA_CLEAN_DIR) if f.endswith(".json")]
-    )
-
-    processed = 0
-    uploaded = 0
-    for path in files:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                articles = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Failed to read cleaned file {path}: {e}")
-            continue
-
+        exported, failed = 0, 0
         for article in articles:
-            processed += 1
-            if export_article(article):
-                uploaded += 1
+            try:
+                _create_pdf(article, subfolder=article.get("sub_area"), output_dir=target_dir)
+                exported += 1
+            except Exception as e:
+                logger.error(f"Failed export {article.get('url')}: {e}")
+                failed += 1
+    finally:
+        conn.close()
 
-    logger.info(f"PDF export complete: {processed} processed, {uploaded} uploaded to Drive")
-    return {"processed": processed, "uploaded": uploaded}
+    summary = {"exported": exported, "failed": failed}
+    logger.info(f"PDF export complete: {summary}")
+    return summary
 
 
 if __name__ == "__main__":
-    run()
+    export_and_upload()

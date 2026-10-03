@@ -1,44 +1,53 @@
-"""Split cleaned article content into overlapping token-based chunks."""
-import json
-import os
+"""Split clean_articles content (read from PostgreSQL) into overlapping token-based chunks."""
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 import tiktoken
 from loguru import logger
 
-from config import CHUNK_OVERLAP_TOKENS, CHUNK_SIZE_TOKENS, DATA_CHUNKS_DIR, DATA_CLEAN_DIR
+from config import CHUNK_OVERLAP_TOKENS, CHUNK_SIZE_TOKENS
+from db.postgres import get_all_clean_articles, get_connection
 
 _encoding = tiktoken.get_encoding("cl100k_base")
 
 
-def derive_article_id(url: str) -> uuid.UUID:
-    """Derive a deterministic article UUID from its URL.
+def _derive_chunk_id(url: str, chunk_index: int) -> uuid.UUID:
+    """Derive a deterministic chunk UUID from an article's URL and chunk index.
 
-    URL-derived UUIDs keep article and chunk ids stable across pipeline
-    re-runs, which is what makes chunking and embedding idempotent.
+    A URL-derived UUID keeps chunk ids stable across pipeline re-runs (the
+    same article always yields the same chunk ids), which is what makes
+    embedding idempotent.
 
     Args:
         url: The article's canonical URL.
-
-    Returns:
-        A UUID deterministically derived from the URL.
-    """
-    return uuid.uuid5(uuid.NAMESPACE_URL, url)
-
-
-def derive_chunk_id(article_id: uuid.UUID, chunk_index: int) -> uuid.UUID:
-    """Derive a deterministic chunk UUID from its article id and index.
-
-    Args:
-        article_id: The parent article's UUID.
         chunk_index: The chunk's position within the article.
 
     Returns:
-        A UUID deterministically derived from article_id and chunk_index.
+        A UUID deterministically derived from url and chunk_index.
     """
-    return uuid.uuid5(article_id, str(chunk_index))
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"{url}#{chunk_index}")
+
+
+def _format_date(published: Any) -> Optional[str]:
+    """Convert a clean_articles.published value into an ISO date string.
+
+    psycopg2 returns PostgreSQL TIMESTAMPTZ columns as datetime objects,
+    but pipeline/embedder.py's date parsing expects an ISO 8601 string.
+
+    Args:
+        published: A datetime, date, string, or None, as returned by psycopg2.
+
+    Returns:
+        ISO date string (YYYY-MM-DD), or None if published is empty.
+    """
+    if not published:
+        return None
+    if isinstance(published, datetime):
+        return published.date().isoformat()
+    if isinstance(published, date):
+        return published.isoformat()
+    return str(published)
 
 
 def split_tokens(text: str, chunk_size: int = CHUNK_SIZE_TOKENS, overlap: int = CHUNK_OVERLAP_TOKENS) -> list[str]:
@@ -66,28 +75,38 @@ def split_tokens(text: str, chunk_size: int = CHUNK_SIZE_TOKENS, overlap: int = 
     return chunks
 
 
-def chunk_article(article: dict[str, Any]) -> list[dict[str, Any]]:
-    """Chunk a single cleaned article into embed-ready records.
+def _split_into_chunks(article: dict[str, Any]) -> list[dict[str, Any]]:
+    """Chunk a single clean_articles row into embed-ready records.
+
+    Field names match what pipeline/embedder.py and vectorization/qdrant_store.py
+    already expect: `date` (not `published`) and `category` (not `topic_category`).
 
     Args:
-        article: Cleaned article dict with source, title, content, date, url, category.
+        article: A clean_articles row (dict) as returned by get_all_clean_articles,
+            with id, url, title, content, published, source, topic_category, sub_area,
+            keyword.
 
     Returns:
         List of chunk dicts carrying chunk_id, article_id, source, title, date,
-        category, url, chunk_index, and chunk_text.
+        category, sub_area, keyword, url, chunk_index, and chunk_text.
     """
-    article_id = derive_article_id(article["url"])
+    article_id = str(article["id"])
+    url = article["url"]
     pieces = split_tokens(article["content"])
+    published = _format_date(article.get("published"))
 
     return [
         {
-            "chunk_id": str(derive_chunk_id(article_id, idx)),
-            "article_id": str(article_id),
-            "source": article["source"],
-            "title": article["title"],
-            "date": article["date"],
-            "category": article["category"],
-            "url": article["url"],
+            "chunk_id": str(_derive_chunk_id(url, idx)),
+            "article_id": article_id,
+            "source": article.get("source"),
+            "title": article.get("title"),
+            "date": published,
+            "category": article.get("topic_category"),
+            "sub_area": article.get("sub_area"),
+            "keyword": article.get("keyword"),
+            "language": article.get("language", "en"),
+            "url": url,
             "chunk_index": idx,
             "chunk_text": piece,
         }
@@ -95,44 +114,25 @@ def chunk_article(article: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def run(clean_file: Optional[str] = None) -> str:
-    """Chunk all (or one) cleaned article file(s) and save chunk records as JSON.
-
-    Args:
-        clean_file: Optional specific cleaned JSON file to process. Defaults to
-            processing every file in data/clean/.
+def chunk_articles() -> list[dict[str, Any]]:
+    """Read every clean_articles row from PostgreSQL and split it into chunks.
 
     Returns:
-        Path to the written chunks JSON file.
+        List of chunk dicts, ready to pass to pipeline.embedder.embed_and_store.
     """
-    os.makedirs(DATA_CHUNKS_DIR, exist_ok=True)
-    files = (
-        [clean_file]
-        if clean_file
-        else [os.path.join(DATA_CLEAN_DIR, f) for f in os.listdir(DATA_CLEAN_DIR) if f.endswith(".json")]
-    )
+    conn = get_connection()
+    try:
+        articles = get_all_clean_articles(conn)
+    finally:
+        conn.close()
 
     all_chunks: list[dict[str, Any]] = []
-    for path in files:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                articles = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Failed to read cleaned file {path}: {e}")
-            continue
+    for article in articles:
+        all_chunks.extend(_split_into_chunks(article))
 
-        for article in articles:
-            chunks = chunk_article(article)
-            all_chunks.extend(chunks)
-
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    out_path = os.path.join(DATA_CHUNKS_DIR, f"chunks_{timestamp}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(all_chunks, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"Saved {len(all_chunks)} chunks to {out_path}")
-    return out_path
+    logger.info(f"Chunked {len(all_chunks)} chunks from {len(articles)} articles")
+    return all_chunks
 
 
 if __name__ == "__main__":
-    run()
+    chunk_articles()

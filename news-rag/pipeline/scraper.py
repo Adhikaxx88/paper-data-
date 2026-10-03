@@ -1,110 +1,301 @@
-"""Scrape Google News articles by keyword and save raw JSON to data/raw/."""
-import json
-import os
-from datetime import datetime
-from typing import Any
+"""Scrape Google News via RSS and insert articles directly into PostgreSQL raw_articles."""
+import random
+import socket
+import time
+import urllib.parse
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from gnews import GNews
+import feedparser
+import trafilatura
+from googlenewsdecoder import gnewsdecoder
 from loguru import logger
 
-from config import ARTICLES_PER_KEYWORD, DATA_RAW_DIR, NEWS_KEYWORDS
+from config import (
+    GOOGLE_NEWS_RSS_TEMPLATE,
+    GOOGLE_NEWS_RSS_TEMPLATE_ID,
+    MAX_ARTICLE_AGE_DAYS,
+    MAX_ARTICLES_PER_TOPIC,
+    MIN_CONTENT_LENGTH,
+    SCRAPE_DELAY_MAX_SECONDS,
+    SCRAPE_DELAY_MIN_SECONDS,
+    TOPIC_QUERIES,
+    TOPIC_QUERIES_ID,
+    USER_AGENTS,
+)
+from db.postgres import get_connection, insert_raw_article
 
 
-def _load_existing_urls() -> set[str]:
-    """Collect URLs already present in previously saved raw JSON files.
-
-    Scanning prior output lets re-runs skip articles already scraped,
-    keeping the scraper idempotent across pipeline runs.
-
-    Returns:
-        Set of article URLs already saved under data/raw/.
-    """
-    urls: set[str] = set()
-    if not os.path.isdir(DATA_RAW_DIR):
-        return urls
-    for filename in os.listdir(DATA_RAW_DIR):
-        if not filename.endswith(".json"):
-            continue
-        path = os.path.join(DATA_RAW_DIR, filename)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                articles = json.load(f)
-            urls.update(a["url"] for a in articles if a.get("url"))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Skipping unreadable raw file {path}: {e}")
-    return urls
-
-
-def scrape_keyword(client: GNews, keyword: str, existing_urls: set[str]) -> list[dict[str, Any]]:
-    """Scrape Google News articles for a single keyword.
+def _fetch_rss(query: str, rss_template: str = GOOGLE_NEWS_RSS_TEMPLATE) -> list[Any]:
+    """Fetch Google News RSS results for a search query.
 
     Args:
-        client: A configured GNews client.
-        keyword: Search term used both as the query and the article category.
-        existing_urls: URLs already scraped; matches are skipped and this set is updated in place.
+        query: Free-text search query.
+        rss_template: Google News RSS URL template to use (controls language/region).
 
     Returns:
-        List of article dicts with source, title, content, date, url, category.
+        List of feedparser entries, or an empty list on failure.
     """
-    results: list[dict[str, Any]] = []
+    print(f"[DEBUG] Fetching RSS for query: {query}", flush=True)
+    url = rss_template.format(query=urllib.parse.quote(query))
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(30)
     try:
-        raw_results = client.get_news(keyword)
+        feed = feedparser.parse(url, request_headers={"User-Agent": random.choice(USER_AGENTS)})
     except Exception as e:
-        logger.error(f"Failed to fetch news for keyword '{keyword}': {e}")
-        return results
+        logger.error(f"Failed to fetch RSS for query '{query}': {e}")
+        return []
+    finally:
+        socket.setdefaulttimeout(old_timeout)
 
-    for item in raw_results:
-        url = item.get("url", "")
-        if not url or url in existing_urls:
-            continue
+    print(f"[DEBUG] RSS fetched, got {len(feed.entries)} entries", flush=True)
 
-        content = item.get("description", "") or ""
-        try:
-            full_article = client.get_full_article(url)
-            if full_article and full_article.text:
-                content = full_article.text
-        except Exception as e:
-            logger.warning(f"Could not fetch full article text for {url}: {e}")
-
-        results.append(
-            {
-                "source": (item.get("publisher") or {}).get("title", "unknown"),
-                "title": item.get("title", ""),
-                "content": content,
-                "date": item.get("published date", ""),
-                "url": url,
-                "category": keyword,
-            }
-        )
-        existing_urls.add(url)
-    return results
+    if feed.bozo:
+        logger.warning(f"Malformed/blocked RSS feed for query '{query}': {feed.bozo_exception}")
+    if not feed.entries:
+        logger.warning(f"No entries returned for query '{query}'")
+    return list(feed.entries)
 
 
-def run() -> str:
-    """Scrape all configured keywords and save newly found articles as raw JSON.
+def _filter_by_age(entries: list[Any], max_age_days: int) -> list[Any]:
+    """Drop entries older than max_age_days.
+
+    Args:
+        entries: feedparser entries.
+        max_age_days: Maximum article age in days; entries without a parsable
+            publish date are kept (age can't be determined, so don't drop them).
 
     Returns:
-        Path to the written JSON file.
+        Filtered list of entries.
     """
-    os.makedirs(DATA_RAW_DIR, exist_ok=True)
-    existing_urls = _load_existing_urls()
-    client = GNews(language="id", max_results=ARTICLES_PER_KEYWORD)
-    all_articles: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+    kept = []
+    for entry in entries:
+        parsed = getattr(entry, "published_parsed", None)
+        if not parsed:
+            kept.append(entry)
+            continue
+        published = datetime(*parsed[:6], tzinfo=timezone.utc)
+        if (now - published).days <= max_age_days:
+            kept.append(entry)
+    return kept
 
-    for keyword in NEWS_KEYWORDS:
-        logger.info(f"Scraping Google News for keyword: {keyword}")
-        articles = scrape_keyword(client, keyword, existing_urls)
-        logger.info(f"Found {len(articles)} new articles for '{keyword}'")
-        all_articles.extend(articles)
 
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    out_path = os.path.join(DATA_RAW_DIR, f"scrape_{timestamp}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(all_articles, f, ensure_ascii=False, indent=2)
+def _sort_by_date(entries: list[Any]) -> list[Any]:
+    """Sort entries newest-first, entries without a date last.
 
-    logger.info(f"Saved {len(all_articles)} new articles to {out_path}")
-    return out_path
+    Args:
+        entries: feedparser entries.
+
+    Returns:
+        Sorted list of entries.
+    """
+    return sorted(entries, key=lambda e: getattr(e, "published_parsed", None) or (), reverse=True)
+
+
+def _decode_url(google_url: str) -> str:
+    """Resolve a Google News redirect URL to the underlying publisher URL.
+
+    Args:
+        google_url: The `link` field from a Google News RSS entry.
+
+    Returns:
+        The decoded publisher URL, or the original URL if decoding fails.
+    """
+    try:
+        result = gnewsdecoder(google_url)
+        if result.get("status") and result.get("decoded_url"):
+            return result["decoded_url"]
+    except Exception as e:
+        logger.warning(f"Could not decode Google News URL {google_url}: {e}")
+        return google_url
+    logger.warning(f"Falling back to raw Google News URL (decode unsuccessful): {google_url}")
+    return google_url
+
+
+def _extract_content(url: str) -> str:
+    """Download and extract the main article text from a URL.
+
+    Args:
+        url: The publisher article URL.
+
+    Returns:
+        Extracted article text, or an empty string on failure.
+    """
+    try:
+        print(f"[DEBUG] Fetching content from: {url}", flush=True)
+        downloaded = trafilatura.fetch_url(url)
+        print(f"[DEBUG] Content fetched, length: {len(downloaded) if downloaded else 0}", flush=True)
+        if downloaded is None:
+            return ""
+        extracted = trafilatura.extract(
+            downloaded, include_comments=False, include_tables=False, no_fallback=False
+        )
+        return extracted or ""
+    except Exception as e:
+        logger.warning(f"Could not extract content from {url}: {e}")
+        return ""
+
+
+def _normalize_date(entry: Any) -> Optional[datetime]:
+    """Convert a feed entry's published date into a timezone-aware datetime.
+
+    Args:
+        entry: feedparser entry.
+
+    Returns:
+        A UTC datetime, or None if the entry has no parsable date.
+    """
+    parsed = getattr(entry, "published_parsed", None)
+    if not parsed:
+        return None
+    return datetime(*parsed[:6], tzinfo=timezone.utc)
+
+
+def _extract_source(entry: Any) -> str:
+    """Extract the publisher name from a feed entry.
+
+    Args:
+        entry: feedparser entry.
+
+    Returns:
+        The publisher name, or "unknown" if not present.
+    """
+    source = getattr(entry, "source", None)
+    if source and getattr(source, "title", None):
+        return source.title
+    title = getattr(entry, "title", "") or ""
+    if " - " in title:
+        return title.rsplit(" - ", 1)[-1].strip()
+    return "unknown"
+
+
+def _polite_delay() -> None:
+    """Sleep a random, human-ish interval between requests to avoid rate limiting."""
+    time.sleep(random.uniform(SCRAPE_DELAY_MIN_SECONDS, SCRAPE_DELAY_MAX_SECONDS))
+
+
+def _scrape_topic_queries(
+    topic_queries: dict[str, dict[str, list[dict]]],
+    rss_template: str,
+    language: str,
+    max_per_query: int,
+    max_age_days: int,
+) -> dict[str, int]:
+    """Scrape every query in a topic_queries dict and insert new articles into PostgreSQL.
+
+    Args:
+        topic_queries: Mapping of category name to a mapping of sub_area name
+            to a list of {"keyword": ...} dicts.
+        rss_template: Google News RSS URL template to use (controls language/region).
+        language: Language code to tag inserted articles with (e.g. "en", "id").
+        max_per_query: Maximum number of newly-inserted articles per query.
+        max_age_days: Drop RSS entries older than this many days.
+
+    Returns:
+        Summary dict: scraped, inserted, skipped_duplicate, skipped_short.
+    """
+    scraped, inserted, dup, short = 0, 0, 0, 0
+
+    for category, sub_areas in topic_queries.items():
+        for sub_area, query_entries in sub_areas.items():
+            for query_entry in query_entries:
+                query = query_entry["keyword"]
+
+                entries = _fetch_rss(query, rss_template)
+                entries = _filter_by_age(entries, max_age_days)
+                entries = _sort_by_date(entries)
+
+                conn = get_connection()
+                try:
+                    count = 0
+                    examined = 0
+                    for entry in entries:
+                        if count >= max_per_query:
+                            break
+                        if examined >= max_per_query * 3:
+                            break
+                        examined += 1
+
+                        try:
+                            link = getattr(entry, "link", None)
+                            if not link:
+                                logger.warning(f"Skipping entry with no link for query '{query}'")
+                                continue
+
+                            print(f"[DEBUG] Decoding URL: {getattr(entry, 'link', 'NO_LINK')}", flush=True)
+                            url = _decode_url(link)
+                            print(f"[DEBUG] Decoded to: {url}", flush=True)
+                            content = _extract_content(url)
+                            scraped += 1
+
+                            if len(content) < MIN_CONTENT_LENGTH:
+                                short += 1
+                                _polite_delay()
+                                continue
+
+                            article = {
+                                "url": url,
+                                "title": getattr(entry, "title", ""),
+                                "content": content,
+                                "published": _normalize_date(entry),
+                                "source": _extract_source(entry),
+                                "topic_category": category,
+                                "sub_area": sub_area,
+                                "search_query": query,
+                                "keyword": query,
+                                "language": language,
+                            }
+
+                            result = insert_raw_article(conn, article)
+                            if result:
+                                inserted += 1
+                                count += 1
+                            else:
+                                dup += 1
+
+                            _polite_delay()
+                        except Exception as e:
+                            logger.error(f"Error processing entry for query '{query}': {e}")
+                            continue
+                finally:
+                    conn.close()
+
+    return {"scraped": scraped, "inserted": inserted, "skipped_duplicate": dup, "skipped_short": short}
+
+
+def fetch_and_store(
+    topic_queries: dict[str, dict[str, list[dict]]] = TOPIC_QUERIES,
+    max_per_query: int = MAX_ARTICLES_PER_TOPIC,
+    max_age_days: int = MAX_ARTICLE_AGE_DAYS,
+) -> dict[str, int]:
+    """Scrape every configured query (English and Indonesian) and insert new
+    articles directly into PostgreSQL.
+
+    Args:
+        topic_queries: Mapping of category name to a mapping of sub_area name
+            to a list of {"keyword": ...} dicts, used for the English pass.
+        max_per_query: Maximum number of newly-inserted articles per query.
+        max_age_days: Drop RSS entries older than this many days.
+
+    Returns:
+        Summary dict: scraped, inserted, skipped_duplicate, skipped_short.
+    """
+    # TEMP: English scrape disabled, only running Indonesian pass.
+    # en_summary = _scrape_topic_queries(
+    #     topic_queries, GOOGLE_NEWS_RSS_TEMPLATE, "en", max_per_query, max_age_days
+    # )
+    id_summary = _scrape_topic_queries(
+        TOPIC_QUERIES_ID, GOOGLE_NEWS_RSS_TEMPLATE_ID, "id", max_per_query, max_age_days
+    )
+
+    summary = {
+        key: id_summary[key]
+        for key in ("scraped", "inserted", "skipped_duplicate", "skipped_short")
+    }
+    logger.info(f"Scrape complete: {summary}")
+    return summary
 
 
 if __name__ == "__main__":
-    run()
+    fetch_and_store()

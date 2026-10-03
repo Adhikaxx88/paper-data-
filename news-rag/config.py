@@ -992,16 +992,10 @@ EMBED_DIM: int = int(os.getenv("EMBED_DIM", "1024"))
 RERANKER_MODEL_NAME: str = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 RERANKER_TOP_K: int = int(os.getenv("RERANKER_TOP_K", "5"))
 
-# Legacy names still imported by unchanged HEAD modules (pipeline/scraper.py,
-# pipeline/embedder.py, rag/generator.py). Removed in the commits that migrate those modules.
-NEWS_KEYWORDS: list[str] = [
-    kw.strip() for kw in os.getenv("NEWS_KEYWORDS", "pinjol,fintech,kredit digital").split(",") if kw.strip()
-]
-INFINITY_URL: str = os.getenv("INFINITY_URL", "http://infinity:7997")
-EMBED_MODEL: str = os.getenv("EMBED_MODEL", "BAAI/bge-large-en-v1.5")
+# Legacy name still imported by an unchanged HEAD module (rag/generator.py).
+# Removed in the commit that migrates rag/generator.py.
 OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://ollama:11434/v1")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
-ARTICLES_PER_KEYWORD: int = 20
 
 QDRANT_COLLECTION: str = os.getenv("COLLECTION_NAME", "data-paper-child")
 
