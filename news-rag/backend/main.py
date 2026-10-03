@@ -1,23 +1,46 @@
 """FastAPI backend exposing the news RAG pipeline as an HTTP API for the React frontend."""
+import re
+import sys
 import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+# Make the project root importable regardless of whether this module is run
+# as "backend.main" (docker-compose: cwd=project root) or as bare "main"
+# (backend/start.bat: cwd=backend/) — both need `config`, `db`, `rag`,
+# `vectorization`, and `backend.*` to resolve.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
 
+from backend.retrieval.searcher import get_dense_model
+from backend.routers.search import router as search_router
 from db import postgres
 from rag.pipeline import ask
 
-app = FastAPI(title="News RAG Chatbot API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load the dense embedding model at startup (already loaded on import, cached here)."""
+    app.state.model = get_dense_model()
+    logger.info("Dense embedding model ready")
+    yield
+
+
+app = FastAPI(title="News RAG Chatbot API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(search_router, prefix="/api")
 
 
 class SessionResponse(BaseModel):
@@ -45,6 +68,105 @@ class SourceOut(BaseModel):
     source: str
     date: str
     score: float
+    url: str
+    article_id: str
+    content: str
+
+
+_HASH_SUFFIX_RE = re.compile(r"\s+[0-9a-f]{8}(-[0-9a-f]+)?$", re.IGNORECASE)
+
+
+def _clean_title(title: str) -> str:
+    """Strip ingestion artifacts from an article title.
+
+    Manually uploaded (drive_reviewed) filenames pick up a trailing content
+    hash (e.g. "... medcom id c2e43613") and use underscores in place of
+    spaces (e.g. "KESEHATAN MENTAL_ Orang Tua Abai..."). Applied to every
+    title, not just drive_reviewed ones, since it's a no-op when neither
+    artifact is present.
+
+    Args:
+        title: The raw article title from the chunk payload.
+
+    Returns:
+        The title with any trailing hash suffix removed, underscores turned
+        into spaces, and whitespace collapsed/trimmed.
+    """
+    cleaned = _HASH_SUFFIX_RE.sub("", title)
+    cleaned = cleaned.replace("_", " ")
+    return " ".join(cleaned.split())
+
+
+def _truncate_at_word(text: str, max_len: int = 40) -> str:
+    """Truncate text to at most max_len chars, breaking on a word boundary.
+
+    Args:
+        text: The text to truncate.
+        max_len: Maximum length before adding an ellipsis.
+
+    Returns:
+        text unchanged if it already fits; otherwise cut at the last space
+        before max_len (or hard-cut if there's no space to break on), with
+        "..." appended.
+    """
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    last_space = truncated.rfind(" ")
+    if last_space > 0:
+        truncated = truncated[:last_space]
+    return truncated + "..."
+
+
+def _display_source(clean_title: str, source: str) -> str:
+    """Resolve a human-readable source label.
+
+    Manually uploaded articles are stored with source="drive_reviewed" (the
+    ingestion path, not a publication name), which is meaningless to a
+    reader — fall back to the (already-cleaned) article title in that case.
+
+    Args:
+        clean_title: The article's title, already run through _clean_title.
+        source: The raw source value from the chunk payload.
+
+    Returns:
+        "drive_reviewed" articles: clean_title truncated to 40 chars at a
+        word boundary. Otherwise: the source unchanged.
+    """
+    if source != "drive_reviewed":
+        return source
+    return _truncate_at_word(clean_title, 40)
+
+
+MIN_SOURCE_SCORE = 0.3
+NO_CONTEXT_PHRASE = "tidak ditemukan informasi yang relevan"
+
+
+def _should_hide_sources(answer: str, raw_sources: list[dict]) -> bool:
+    """Decide whether the citations backing an answer are worth showing.
+
+    Surfacing sources next to an answer the model itself flagged as
+    unsupported, or that were only weakly related to the question, misleads
+    the reader into thinking the answer is better-grounded than it is. Note:
+    this endpoint (rag.pipeline.ask) doesn't run any prompt-injection
+    guardrail — that check exists only on backend/routers/search.py's
+    /api/search path — so there's nothing to gate on for that case here.
+
+    Args:
+        answer: The generated answer text.
+        raw_sources: Retrieved chunk dicts from rag.retriever.retrieve,
+            each with a "score" key (RRF fusion score).
+
+    Returns:
+        True if sources should be omitted from the response.
+    """
+    if not raw_sources:
+        return True
+    if NO_CONTEXT_PHRASE in answer.lower():
+        return True
+    if max(s["score"] for s in raw_sources) < MIN_SOURCE_SCORE:
+        return True
+    return False
 
 
 class ChatResponse(BaseModel):
@@ -118,8 +240,31 @@ def chat(request: ChatRequest) -> ChatResponse:
         logger.error(f"Chat pipeline failed for session {session_uuid}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    sources = [
-        SourceOut(title=s["title"], source=s["source"], date=s["date"] or "", score=s["score"])
-        for s in result["sources"]
-    ]
+    sources = []
+    if not _should_hide_sources(result["answer"], result["sources"]):
+        sources = []
+        for s in result["sources"]:
+            clean_title = _clean_title(s["title"])
+            raw_url = s["url"] or ""
+            sources.append(
+                SourceOut(
+                    title=clean_title,
+                    source=_display_source(clean_title, s["source"]),
+                    date=s["date"] or "",
+                    score=s["score"],
+                    # Only expose real, navigable URLs — ingestion paths for
+                    # manually uploaded articles use synthetic
+                    # "drive_reviewed://<filename>.pdf" placeholders that
+                    # aren't a valid link destination.
+                    url=raw_url if raw_url.startswith("http") else "",
+                    article_id=s["article_id"],
+                    content=s["chunk_text"] or "",
+                )
+            )
     return ChatResponse(answer=result["answer"], sources=sources)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
