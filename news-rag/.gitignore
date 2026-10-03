@@ -13,3 +13,7 @@ credentials.json
 token.json
 site/
 .DS_Store
+
+# Local secrets (any folder) and scraped data (not source code)
+**/.env.local
+data/
