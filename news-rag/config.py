@@ -992,6 +992,45 @@ EMBED_DIM: int = int(os.getenv("EMBED_DIM", "1024"))
 RERANKER_MODEL_NAME: str = os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3")
 RERANKER_TOP_K: int = int(os.getenv("RERANKER_TOP_K", "5"))
 
+# Generation — all LLM calls go through OpenRouter (OpenAI-compatible API).
+# Three roles use three different models (see paper methodology notes):
+#   DATASET_GENERATOR_MODEL -> evaluation/generate_dataset.py
+#   RAG_GENERATOR_MODEL     -> rag/generator.py, backend/generation/generator.py
+#   JUDGE_MODEL             -> evaluation/evaluate.py (RAGAS + DeepEval)
+#   GUARDRAIL_MODEL         -> backend/guardrails/input.py (scope/language)
+OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+DATASET_GENERATOR_MODEL: str = os.getenv("DATASET_GENERATOR_MODEL", "openai/gpt-4o-mini")
+RAG_GENERATOR_MODEL: str = os.getenv("RAG_GENERATOR_MODEL", "deepseek/deepseek-chat-v3-0324")
+JUDGE_MODEL: str = os.getenv("JUDGE_MODEL", "google/gemini-2.5-flash")
+GUARDRAIL_MODEL: str = os.getenv("GUARDRAIL_MODEL", "openai/gpt-4o-mini")
+
+# OpenRouter provider slugs to pin per role (e.g. the host serving deepseek-chat-v3-0324).
+# Empty = no pin, so OpenRouter may route each request to any provider. Set these for
+# reproducible evaluation runs and record them in results.csv.
+DATASET_GENERATOR_PROVIDER: str = os.getenv("DATASET_GENERATOR_PROVIDER", "")
+RAG_GENERATOR_PROVIDER: str = os.getenv("RAG_GENERATOR_PROVIDER", "")
+JUDGE_PROVIDER: str = os.getenv("JUDGE_PROVIDER", "")
+GUARDRAIL_PROVIDER: str = os.getenv("GUARDRAIL_PROVIDER", "")
+
+
+def provider_body(provider_slug: str) -> dict:
+    """Return the OpenRouter provider-routing fragment for a request body.
+
+    An empty slug returns {} (no pin). A non-empty slug pins the request to that
+    provider and disables fallback, so a silent reroute fails loudly instead of
+    changing the model's serving stack mid-evaluation.
+
+    Args:
+        provider_slug: OpenRouter provider name, e.g. as shown on the model's page.
+
+    Returns:
+        {"provider": {...}} or {}.
+    """
+    if not provider_slug:
+        return {}
+    return {"provider": {"order": [provider_slug], "allow_fallbacks": False}}
+
 # Legacy name still imported by an unchanged HEAD module (rag/generator.py).
 # Removed in the commit that migrates rag/generator.py.
 OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://ollama:11434/v1")
