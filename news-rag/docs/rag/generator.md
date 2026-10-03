@@ -4,14 +4,13 @@
 
 ## Model
 
-By default, generation runs on **Llama 3.1** served locally by
-[Ollama](https://ollama.com) (the `ollama` service in `docker-compose.yml`).
-Ollama exposes an OpenAI-compatible `/v1/chat/completions` endpoint, so
-`rag/generator.py` talks to it with the standard `openai` SDK, just pointed
-at `OLLAMA_URL` (`config.py`) instead of `api.openai.com` — no API key or
-external network call required. Change `OLLAMA_MODEL` in `.env` to use a
-different pulled model (see
-[Setup → Switching the Ollama model](../setup.md#switching-the-ollama-model)).
+Generation runs on **[OpenRouter](https://openrouter.ai)** using the model in
+`RAG_GENERATOR_MODEL` (default `deepseek/deepseek-chat-v3-0324`). `rag/generator.py`
+uses the standard `openai` SDK pointed at `OPENROUTER_BASE_URL`
+(`https://openrouter.ai/api/v1`), authenticated with `OPENROUTER_API_KEY`.
+Change `RAG_GENERATOR_MODEL` in `.env` to switch models; no code change is needed.
+The same model is used by the `/api/search` generator in
+`backend/generation/generator.py`.
 
 ## System prompt template
 
@@ -68,6 +67,6 @@ respond with the fixed fallback message rather than guessing:
 > "Maaf, tidak ditemukan informasi yang relevan untuk menjawab pertanyaan
 > ini."
 
-If the LLM call itself fails (Ollama not running, model not pulled, network
-error, etc.), the exception is caught and logged, and a generic Indonesian
+If the LLM call itself fails (invalid or missing `OPENROUTER_API_KEY`, quota or
+rate limit, unknown model slug, network error, etc.), the exception is caught and logged, and a generic Indonesian
 error message is returned instead of raising and crashing the chat session.

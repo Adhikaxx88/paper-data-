@@ -42,6 +42,7 @@ nav:
   - Home: index.md
   - Architecture: architecture.md
   - Setup: setup.md
+  - Quickstart: quickstart.md
   - Pipeline:
       - Scraper: pipeline/scraper.md
       - Cleaner: pipeline/cleaner.md
@@ -55,4 +56,10 @@ nav:
       - Retriever: rag/retriever.md
       - Generator: rag/generator.md
       - Pipeline: rag/pipeline.md
+  - Guardrails: guardrails.md
+  - Retrieval (guardrailed API): retrieval.md
+  - Generation (guardrailed API): generation.md
   - Frontend: frontend.md
+  - API Reference: api.md
+  - Evaluation: evaluation.md
+  - Scripts: scripts.md

@@ -1,9 +1,9 @@
 # Setup
 
-The pipeline and chatbot run entirely on a **local, self-hosted stack** by
-default: [infinity-emb](https://github.com/michaelfeil/infinity) serves BGE
-embeddings and [Ollama](https://ollama.com) serves the LLM, so no OpenAI API
-key is required. The easiest way to run everything is
+Embeddings and reranking run locally, and **all LLM calls go through
+[OpenRouter](https://openrouter.ai)** (generation, guardrails, dataset
+generation, and evaluation judge), so an OpenRouter API key is required. The
+easiest way to run everything is
 [Docker Compose](#running-with-local-stack-docker) — see that section below.
 The rest of this page covers running each piece manually without Docker.
 
@@ -15,10 +15,8 @@ The rest of this page covers running each piece manually without Docker.
 - A local embedding server compatible with the OpenAI `/embeddings` API,
   serving `BAAI/bge-large-en-v1.5` (e.g. infinity-emb) — see
   [Embedder](pipeline/embedder.md)
-- A local Ollama instance with a model pulled (default `llama3.1`) — see
+- An OpenRouter API key (`OPENROUTER_API_KEY`) — see
   [Generator](rag/generator.md)
-- (Optional) An OpenAI API key, only if you point `pipeline/embedder.py` /
-  `rag/generator.py` back at OpenAI instead of the local stack
 - (Optional) A Google Cloud service account with Drive API access, if you
   want PDF backups uploaded to Drive
 
@@ -47,23 +45,25 @@ cp .env.example .env
 
 | Variable | Description |
 |---|---|
-| `OPENAI_API_KEY` | Optional. Only used if you switch `pipeline/embedder.py` / `rag/generator.py` back to OpenAI-hosted models. |
-| `POSTGRES_URL` | Connection string, e.g. `postgresql://user:password@localhost:5432/newsrag` (use `postgres` as the host under Docker Compose). |
+| `OPENROUTER_API_KEY` | Required. Key for OpenRouter, used by every LLM call (generation, guardrails, dataset generator, judge). Keep it in `.env` only. |
+| `OPENROUTER_BASE_URL` | Defaults to `https://openrouter.ai/api/v1`. |
+| `RAG_GENERATOR_MODEL` | Model for answer generation, e.g. `deepseek/deepseek-chat-v3-0324`. |
+| `GUARDRAIL_MODEL` | Cheap model for `scope_check` / `language_detect`, e.g. `openai/gpt-4o-mini`. Runs on every `/api/search` query. |
+| `DATASET_GENERATOR_MODEL` | Model that writes the golden Q&A dataset, e.g. `openai/gpt-4o-mini`. |
+| `JUDGE_MODEL` | Model that judges RAGAS and DeepEval metrics, e.g. `google/gemini-2.5-flash`. |
 | `QDRANT_URL` | Base URL of your Qdrant instance, e.g. `http://localhost:6333` (`http://qdrant:6333` under Docker Compose). |
 | `QDRANT_API_KEY` | API key for Qdrant Cloud; leave empty for a local instance without auth. |
 | `GOOGLE_DRIVE_CREDENTIALS_PATH` | Path to a Google service account JSON key file, used by `pipeline/pdf_exporter.py`. |
 | `NEWS_KEYWORDS` | Comma-separated list of keywords/topics to scrape from Google News. Each keyword is also used as the article's `category`. |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials used by the `postgres` container in `docker-compose.yml`; must match the values embedded in `POSTGRES_URL`. |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_HOST` / `POSTGRES_PORT` | Individual components used by both the `postgres` container in `docker-compose.yml` and `config.py`, which assembles them into the connection string (`POSTGRES_HOST` defaults to `127.0.0.1`, `POSTGRES_PORT` to `5432`; use `postgres` as the host under Docker Compose). |
 | `INFINITY_URL` | Base URL of the infinity-emb embedding server, e.g. `http://infinity:7997` under Docker Compose. |
 | `EMBED_MODEL` | Embedding model served by infinity-emb. Default `BAAI/bge-large-en-v1.5`. |
 | `EMBED_DIM` | Vector dimension of `EMBED_MODEL`, used to size the Qdrant collection. Default `1024` (BGE-large). Must match the model — see the warning in the [Docker section](#running-with-local-stack-docker) below if you change it. |
-| `OLLAMA_URL` | OpenAI-compatible base URL of your Ollama instance, e.g. `http://ollama:11434/v1` under Docker Compose. |
-| `OLLAMA_MODEL` | Model name to use for generation, e.g. `llama3.1`. Must already be pulled in Ollama. |
 
 ## Initialize the database
 
 ```bash
-psql $POSTGRES_URL -f db/schema.sql
+psql "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@${POSTGRES_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}/$POSTGRES_DB" -f db/schema.sql
 ```
 
 This creates `articles`, `chunks`, `chat_sessions`, and `chat_messages`.
@@ -95,40 +95,41 @@ service below.
 ## Running with Local Stack (Docker)
 
 This is the recommended way to run the whole system: PostgreSQL, Qdrant,
-infinity-emb (BGE embeddings), Ollama (LLM), the batch pipeline, the FastAPI
-backend, and the React frontend, all wired together by `docker-compose.yml`.
+infinity-emb (BGE embeddings), the batch pipeline, the FastAPI backend, and the
+React frontend, all wired together by `docker-compose.yml`. LLM calls go to
+OpenRouter, so there is no LLM container.
 
 ### Prerequisites
 
 - Docker + Docker Compose (v2)
+- An OpenRouter API key in `.env` (`OPENROUTER_API_KEY`)
 - **At least 16GB RAM** available to Docker. Rough footprint:
   - BGE-large-en-v1.5 (infinity-emb): ~1.3GB
-  - Llama 3.1 (Ollama): ~4.7GB
   - PostgreSQL + Qdrant + backend/frontend: ~2GB
-  - Leaves headroom for model inference, which is the biggest variable cost
+  - Leaves headroom for the embedding and reranking models
 
 ### First-time setup
 
 ```bash
-cp .env.example .env   # adjust POSTGRES_*, keywords, etc. as needed
+cp .env.example .env   # set OPENROUTER_API_KEY, POSTGRES_*, keywords, etc.
 
-# 1. Bring up the data + model-serving layer
-docker compose up -d postgres qdrant infinity ollama
+# 1. Bring up the data + embedding layer
+docker compose up -d postgres qdrant infinity
 
-# 2. Pull the LLM (one-shot; waits for ollama to be healthy)
-docker compose run ollama-init
-
-# 3. Run the batch pipeline once to scrape + index articles
+# 2. Run the batch pipeline once to scrape + index articles
 docker compose run pipeline python run_pipeline.py
 
-# 4. Bring up the API and UI
+# 3. Bring up the API and UI
 docker compose up backend frontend
 ```
 
 ### How to access
 
-Open the chatbot at **`http://localhost:3000`**. The FastAPI backend is
-reachable directly at `http://localhost:8000` (e.g. `GET /docs` for the
+Open the chatbot at **`http://localhost:5173`**. The `frontend` service
+runs the Vite dev server directly inside the container (`node:20-slim`,
+`npm run dev -- --host 0.0.0.0`) rather than a built/nginx-served bundle, so
+Docker and local `npm run dev` land on the same port. The FastAPI backend
+is reachable directly at `http://localhost:8000` (e.g. `GET /docs` for the
 OpenAPI schema).
 
 ### Re-running the pipeline later
@@ -140,20 +141,22 @@ starts as part of `docker compose up` — run it on demand:
 docker compose run pipeline python run_pipeline.py --step scrape
 ```
 
-### Switching the Ollama model
+### Switching the LLM model
 
-1. Update `OLLAMA_MODEL` in `.env`.
-2. Pull the new model into the running Ollama container:
+Each role has its own variable in `.env`. Nothing needs to be pulled, since the
+model is served by OpenRouter.
 
-   ```bash
-   docker compose run ollama ollama pull <model>
-   ```
-
-3. Restart the backend so it picks up the new `.env` value:
+1. Update `RAG_GENERATOR_MODEL`, `GUARDRAIL_MODEL`, `DATASET_GENERATOR_MODEL`,
+   or `JUDGE_MODEL` in `.env`. Use an OpenRouter model slug (`provider/model`).
+2. Restart the backend so it picks up the new `.env` value:
 
    ```bash
    docker compose restart backend
    ```
+
+If you change `DATASET_GENERATOR_MODEL` or `JUDGE_MODEL`, or the generator
+model whose answers are being scored, follow the checkpoint reset steps in
+[evaluation.md](evaluation.md) before re-running the evaluation.
 
 ### Switching embedding models (OpenAI → BGE, or BGE → a different model)
 
@@ -170,11 +173,47 @@ docker compose run backend python -c "from db.qdrant_client import recreate_coll
 docker compose run pipeline python run_pipeline.py --step embed
 ```
 
+### Model caches
+
+`docker-compose.yml` mounts three named volumes so downloaded models
+survive container restarts instead of re-downloading every time:
+`hf_cache` (HuggingFace Hub, used by the dense e5 model and the
+`bge-reranker-v2-m3` cross-encoder), `st_cache` (sentence-transformers), and
+`fastembed_cache` (the BM25 sparse model — fastembed ignores `HF_HOME` and
+defaults to `/tmp/fastembed_cache`, which doesn't survive a container
+recreate without an explicit mount). All three are shared between the
+`pipeline` and `backend` services.
+
+## Running the evaluation pipeline
+
+See [evaluation.md](evaluation.md) for the full walkthrough. Short version:
+
+```bash
+# Generate the golden Q&A dataset (inside Docker)
+docker compose run evaluation python evaluation/generate_dataset.py
+
+# Score the chatbot against it (outside Docker — hits localhost:8000)
+python -m evaluation.evaluate
+```
+
+## Manual article cleanup
+
+To remove one or more articles (and their chunks/vectors) by a title
+pattern, from PostgreSQL and Qdrant together:
+
+```bash
+python scripts/delete_articles_by_title.py "%myanmar%meth%"       # prompts for confirmation
+python scripts/delete_articles_by_title.py "%myanmar%meth%" --yes # skip the prompt
+```
+
+See [scripts.md](scripts.md) for this and the other one-off data-fix
+scripts in `scripts/`.
+
 ## Frontend Development
 
 The FastAPI backend (`backend/main.py`) must be running for the frontend to
 have anything to talk to — either via Docker (`docker compose up -d postgres
-qdrant infinity ollama && docker compose up backend`) or locally
+qdrant infinity && docker compose up backend`) or locally
 (`uvicorn backend.main:app --reload`).
 
 Then, for hot-reloading frontend development outside Docker:

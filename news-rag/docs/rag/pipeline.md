@@ -21,7 +21,7 @@ generation, and persistence:
    question and returns the top-K most relevant chunks. See
    [Retriever](retriever.md).
 5. **Generate the answer.** `rag.generator.generate_answer(question, chunks,
-   history)` builds the prompt and calls the LLM (Ollama by default). See
+   history)` builds the prompt and calls the LLM (`RAG_GENERATOR_MODEL` via OpenRouter). See
    [Generator](generator.md).
 6. **Persist the assistant's answer** to `chat_messages`.
 7. **Return** `{"answer": str, "sources": list[dict]}` to the caller. The

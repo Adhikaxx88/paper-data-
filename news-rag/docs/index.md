@@ -15,11 +15,15 @@ local, self-hosted model stack by default.
   PostgreSQL.
 - **Backs up** each article as a categorized PDF in Google Drive.
 - **Answers questions** by retrieving the most relevant chunks and asking a
-  local LLM (Llama 3.1 via Ollama) to answer strictly from that context,
-  citing sources.
+  an LLM served through OpenRouter (DeepSeek V3 by default) to answer strictly
+  from that context, citing sources.
+- **Evaluates itself** against a golden Indonesian Q&A dataset with RAGAS
+  (faithfulness, answer relevancy, context precision/recall) and DeepEval
+  (hallucination), judged by a separate model on OpenRouter — see
+  [Evaluation](evaluation.md).
 
-Cloud models (OpenAI embeddings + GPT-4o-mini) are still supported as a swap-in
-alternative — see [Architecture](architecture.md#cloud-stack-vs-local-stack).
+Embeddings and reranking stay local (multilingual-e5-large, BM25, bge-reranker-v2-m3).
+All LLM calls (generation, guardrails, dataset generation, judge) go through OpenRouter.
 
 ## Who it's for
 
@@ -30,9 +34,8 @@ story) without relying on a third-party search API.
 ## Quick start
 
 ```bash
-cp .env.example .env
-docker compose up -d postgres qdrant infinity ollama
-docker compose run ollama-init
+cp .env.example .env          # then set OPENROUTER_API_KEY
+docker compose up -d postgres qdrant
 docker compose run pipeline python run_pipeline.py
 docker compose up backend frontend   # chatbot at http://localhost:3000
 ```
