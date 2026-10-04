@@ -104,6 +104,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    profiles:
+      - evaluation
     command: python evaluation/generate_dataset.py
     networks:
       - ragnet
