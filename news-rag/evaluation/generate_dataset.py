@@ -14,6 +14,8 @@ import json
 import re
 import socket
 import sys
+import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -21,7 +23,7 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 from loguru import logger
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 
 def _postgres_hostname_resolves() -> bool:
@@ -77,35 +79,36 @@ from config import (  # noqa: E402
     provider_body,
 )
 
-ARTICLES_PER_SOURCE = 5
-MAX_ARTICLES_TOTAL = 50
+TARGET_TOTAL_QUESTIONS = 2500
 MIN_CONTENT_LENGTH = 500
-QA_PAIRS_PER_ARTICLE = "2-3"
+WARN_PAIRS_PER_ARTICLE = 4
+EXCLUDED_CATEGORIES = {"additional"}
+# Rate limiting: fixed delay between calls, plus exponential backoff on HTTP 429.
+REQUEST_DELAY_SEC = 0.75
+MAX_RETRIES = 4
+BACKOFF_BASE_SEC = 2
 # Separate file so the previous Ollama-generated golden_dataset.csv is kept
 # for comparison until the new one is reviewed.
 OUTPUT_PATH = Path(__file__).parent / "golden_dataset_openrouter.csv"
 
-SAMPLE_QUERY = """
-WITH ranked AS (
-    SELECT
-        id,
-        title,
-        source,
-        content,
-        ROW_NUMBER() OVER (
-            PARTITION BY source ORDER BY LENGTH(content) DESC
-        ) AS rn
-    FROM clean_articles
-    WHERE content IS NOT NULL AND LENGTH(content) > %s
-)
-SELECT id, title, source, content
-FROM ranked
-WHERE rn <= %s
-ORDER BY source, rn
-LIMIT %s
+# Semua artikel (web_scraping + pdf_knowledge). topic_category dinormalisasi di SQL.
+ALL_ARTICLES_QUERY = """
+SELECT
+    id,
+    title,
+    source,
+    content,
+    source_type,
+    lower(replace(topic_category, '-', '_')) AS topic_category
+FROM clean_articles
+WHERE content IS NOT NULL
+  AND LENGTH(content) > %s
+  AND topic_category IS NOT NULL
+  AND lower(topic_category) NOT IN ('additional')
+ORDER BY topic_category, id
 """
 
-GENERATION_PROMPT = """Buat {n} pasang tanya-jawab Bahasa Indonesia dari artikel berikut, \
+GENERATION_PROMPT = """Buat tepat {n} pasang tanya-jawab Bahasa Indonesia dari artikel berikut, \
 seperti pertanyaan orang tua tentang perkembangan anak atau kesehatan mental remaja.
 
 Campurkan jenis pertanyaan: faktual ("Apa itu ..."), praktis ("Bagaimana cara ..."), \
@@ -126,24 +129,83 @@ ATURAN OUTPUT (WAJIB DIIKUTI):
 """
 
 MAX_CONTENT_CHARS = 6000
+RATE_LIMIT_HITS = {"429": 0, "retry": 0}
 
 
-def fetch_sample_articles() -> list[dict[str, Any]]:
-    """Pull a source-diverse sample of clean_articles rows.
-
-    Picks up to ARTICLES_PER_SOURCE longest articles per distinct source,
-    then caps the overall sample at MAX_ARTICLES_TOTAL.
+def fetch_articles() -> list[dict[str, Any]]:
+    """Pull every usable clean_articles row (web_scraping and pdf_knowledge).
 
     Returns:
-        List of dicts with id, title, source, content.
+        List of dicts with id, title, source, content, source_type, topic_category
+        (topic_category already normalized: lower() and "-" -> "_").
     """
     conn = psycopg2.connect(POSTGRES_URL)
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(SAMPLE_QUERY, (MIN_CONTENT_LENGTH, ARTICLES_PER_SOURCE, MAX_ARTICLES_TOTAL))
+            cur.execute(ALL_ARTICLES_QUERY, (MIN_CONTENT_LENGTH,))
             return [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
+
+
+def allocate_questions(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Assign each article a number of Q&A pairs so the total is TARGET_TOTAL_QUESTIONS.
+
+    Step 1: category quota = articles_in_category / total_articles * TARGET,
+    rounded with the largest-remainder method so the quotas sum exactly to TARGET.
+    Step 2: each category's quota is split across its articles as evenly as
+    possible (base = quota // n, the first quota % n articles get one extra).
+
+    Args:
+        articles: Rows from fetch_articles(). Mutated: sets "n_pairs" on each.
+
+    Returns:
+        The same list, with "n_pairs" set on every article.
+    """
+    by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for a in articles:
+        by_cat[a["topic_category"]].append(a)
+
+    total = len(articles)
+    exact = {c: len(v) / total * TARGET_TOTAL_QUESTIONS for c, v in by_cat.items()}
+    quota = {c: int(e) for c, e in exact.items()}
+    leftover = TARGET_TOTAL_QUESTIONS - sum(quota.values())
+    for c in sorted(exact, key=lambda c: exact[c] - quota[c], reverse=True)[:leftover]:
+        quota[c] += 1
+
+    for c, members in by_cat.items():
+        base, extra = divmod(quota[c], len(members))
+        for i, a in enumerate(members):  # members already ordered by id
+            a["n_pairs"] = base + (1 if i < extra else 0)
+    return articles
+
+
+def print_plan(articles: list[dict[str, Any]]) -> None:
+    """Print the category/source distribution table, totals, and cost estimate."""
+    stats: dict[tuple[str, str], dict[str, Any]] = {}
+    for a in articles:
+        key = (a["topic_category"], a["source_type"])
+        s = stats.setdefault(key, {"articles": 0, "questions": 0})
+        s["articles"] += 1
+        s["questions"] += a["n_pairs"]
+
+    print(f"{'kategori':32} {'source_type':14} {'artikel':>8} {'jatah_pertanyaan':>17} {'per_artikel':>12}")
+    for (cat, src), s in sorted(stats.items(), key=lambda kv: -kv[1]["questions"]):
+        per = s["questions"] / s["articles"]
+        flag = "  <-- WARNING >4" if per > WARN_PAIRS_PER_ARTICLE else ""
+        print(f"{cat:32} {src:14} {s['articles']:>8} {s['questions']:>17} {per:>12.2f}{flag}")
+    total_q = sum(a["n_pairs"] for a in articles)
+    print(f"\nTOTAL artikel: {len(articles)} | TOTAL pertanyaan: {total_q} | API calls: {len(articles)}")
+
+    # Rough cost: ~4 chars/token for Indonesian, +~400 tokens prompt overhead per call,
+    # ~60 output tokens per Q&A pair. gpt-4o-mini via OpenRouter: $0.15/M in, $0.60/M out.
+    in_tokens = sum(min(len(a["content"]), 6000) / 4 + 400 for a in articles)
+    out_tokens = total_q * 60
+    cost = in_tokens / 1e6 * 0.15 + out_tokens / 1e6 * 0.60
+    print(f"Estimasi token: input ~{in_tokens/1e6:.2f}M, output ~{out_tokens/1e6:.2f}M")
+    print(f"Estimasi biaya kasar ({DATASET_GENERATOR_MODEL}): ~${cost:.2f} (perkiraan, bukan tagihan)")
+    est_min = len(articles) * (REQUEST_DELAY_SEC + 2.5) / 60
+    print(f"Estimasi durasi (tanpa retry 429): ~{est_min:.0f} menit")
 
 
 def _normalize_pairs(pairs: Any) -> list[dict[str, str]]:
@@ -234,25 +296,38 @@ def generate_qa_for_article(client: OpenAI, article: dict[str, Any]) -> list[dic
         List of {"question", "answer"} dicts, possibly empty on failure.
     """
     content = article["content"][:MAX_CONTENT_CHARS]
-    prompt = GENERATION_PROMPT.format(n=QA_PAIRS_PER_ARTICLE, title=article["title"], content=content)
+    prompt = GENERATION_PROMPT.format(n=article["n_pairs"], title=article["title"], content=content)
 
-    try:
-        response = client.chat.completions.create(
-            model=DATASET_GENERATOR_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-            response_format={"type": "json_object"},
-            extra_body=provider_body(DATASET_GENERATOR_PROVIDER),
-        )
-        raw = response.choices[0].message.content or ""
-    except Exception as e:
-        logger.error(f"LLM generation failed for article {article['id']}: {e}")
-        return []
+    raw = ""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=DATASET_GENERATOR_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                response_format={"type": "json_object"},
+                extra_body=provider_body(DATASET_GENERATOR_PROVIDER),
+            )
+            raw = response.choices[0].message.content or ""
+            break
+        except RateLimitError as e:
+            RATE_LIMIT_HITS["429"] += 1
+            if attempt == MAX_RETRIES:
+                logger.error(f"HTTP 429 persisted after {MAX_RETRIES} retries for article {article['id']}: {e}")
+                return []
+            wait = BACKOFF_BASE_SEC * (2 ** attempt)
+            RATE_LIMIT_HITS["retry"] += 1
+            logger.warning(f"HTTP 429 for article {article['id']}, retry {attempt + 1}/{MAX_RETRIES} in {wait}s")
+            time.sleep(wait)
+        except Exception as e:
+            logger.error(f"LLM generation failed for article {article['id']}: {e}")
+            return []
 
     pairs = parse_qa_pairs(raw)
     if not pairs:
         logger.warning(f"No valid Q&A pairs parsed for article {article['id']} ({article['title']!r})")
-    return pairs
+    # Keep exactly the requested count so the total matches TARGET_TOTAL_QUESTIONS.
+    return pairs[: article["n_pairs"]]
 
 
 def build_dataset(client: OpenAI, articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -267,11 +342,14 @@ def build_dataset(client: OpenAI, articles: list[dict[str, Any]]) -> list[dict[s
     """
     rows = []
     failed_articles = 0
+    short_articles = 0
     for i, article in enumerate(articles, start=1):
-        logger.info(f"[{i}/{len(articles)}] Generating Q&A for: {article['title']!r} ({article['source']})")
+        logger.info(f"[{i}/{len(articles)}] ({article['topic_category']}, n={article['n_pairs']}) {article['title']!r}")
         pairs = generate_qa_for_article(client, article)
         if not pairs:
             failed_articles += 1
+        elif len(pairs) < article["n_pairs"]:
+            short_articles += 1
         for pair in pairs:
             rows.append(
                 {
@@ -280,11 +358,16 @@ def build_dataset(client: OpenAI, articles: list[dict[str, Any]]) -> list[dict[s
                     "article_id": article["id"],
                     "source_title": article["title"],
                     "source": article["source"],
+                    "topic_category": article["topic_category"],
+                    "source_type": article["source_type"],
                     "dataset_model": DATASET_GENERATOR_MODEL,
                     "dataset_provider": DATASET_GENERATOR_PROVIDER,
                 }
             )
+        time.sleep(REQUEST_DELAY_SEC)
     logger.info(f"Articles with zero parsed pairs: {failed_articles}/{len(articles)}")
+    logger.info(f"Articles with fewer pairs than requested: {short_articles}/{len(articles)}")
+    logger.info(f"HTTP 429 hits: {RATE_LIMIT_HITS['429']}, retries: {RATE_LIMIT_HITS['retry']}")
     return rows
 
 
@@ -301,6 +384,8 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         "article_id",
         "source_title",
         "source",
+        "topic_category",
+        "source_type",
         "dataset_model",
         "dataset_provider",
     ]
@@ -311,13 +396,25 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 def main() -> None:
-    articles = fetch_sample_articles()
-    logger.info(f"Sampled {len(articles)} articles across distinct sources")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plan-only", action="store_true", help="print distribution and cost estimate, no API calls")
+    args, _ = parser.parse_known_args()
+
+    articles = allocate_questions(fetch_articles())
+    logger.info(f"Loaded {len(articles)} articles (web_scraping + pdf_knowledge, content > {MIN_CONTENT_LENGTH} chars)")
     if not articles:
-        logger.warning("No articles found matching sampling criteria; nothing to generate")
+        logger.warning("No articles found matching criteria; nothing to generate")
         return
 
-    client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+    print_plan(articles)
+    over = {a["topic_category"] for a in articles if a["n_pairs"] > WARN_PAIRS_PER_ARTICLE}
+    if over:
+        logger.warning(f"Categories with more than {WARN_PAIRS_PER_ARTICLE} pairs/article: {sorted(over)}")
+    if args.plan_only:
+        print("\n--plan-only: tidak ada panggilan API.")
+        return
+
+    client = OpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL, max_retries=0)
     rows = build_dataset(client, articles)
 
     write_csv(rows, OUTPUT_PATH)
