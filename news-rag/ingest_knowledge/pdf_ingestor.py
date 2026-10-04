@@ -234,6 +234,11 @@ def get_db_conn():
     return psycopg2.connect(**DB_CONFIG)
 
 
+def pdf_title(meta: dict, filename: str) -> str:
+    """Title untuk satu PDF; dipakai bersama oleh Postgres dan payload Qdrant."""
+    return f"[{meta.get('sub_area', 'doc').upper()}] {Path(filename).stem.replace('_', ' ').replace('-', ' ')}"
+
+
 def insert_chunk_to_postgres(
     conn,
     chunk: dict,
@@ -256,7 +261,7 @@ def insert_chunk_to_postgres(
 
     # Kalau metadata punya URL canonical, gunakan itu sebagai "source URL" di title/metadata
     # tapi chunk URL-nya tetap synthetic (yang unique)
-    title = f"[{meta.get('sub_area', 'doc').upper()}] {Path(filename).stem.replace('_', ' ').replace('-', ' ')}"
+    title = pdf_title(meta, filename)
 
     with conn.cursor() as cur:
         # ── raw_articles ──
@@ -343,6 +348,7 @@ def upsert_to_qdrant(
 ):
     """Upsert semua chunks dari 1 PDF ke Qdrant."""
     points = []
+    title = pdf_title(meta, filename)
     for i, (chunk, dvec, svec, raw_id) in enumerate(
         zip(chunks, dense_vecs, sparse_vecs, raw_ids)
     ):
@@ -356,6 +362,7 @@ def upsert_to_qdrant(
                 },
                 payload={
                     "raw_id":         raw_id,
+                    "title":          title,
                     "url":            chunk["url"],
                     "source":         meta.get("source"),
                     "topic_category": meta.get("topic_category"),

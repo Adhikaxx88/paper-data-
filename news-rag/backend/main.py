@@ -92,6 +92,8 @@ def _clean_title(title: str) -> str:
         The title with any trailing hash suffix removed, underscores turned
         into spaces, and whitespace collapsed/trimmed.
     """
+    if not title:
+        return ""
     cleaned = _HASH_SUFFIX_RE.sub("", title)
     cleaned = cleaned.replace("_", " ")
     return " ".join(cleaned.split())
