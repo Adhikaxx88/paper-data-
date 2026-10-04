@@ -120,9 +120,12 @@ def hybrid_search(query: str, top_k: int = RETRIEVAL_TOP_K) -> list[dict[str, An
             "title": point.payload.get("title"),
             "url": point.payload.get("url"),
             "keyword": point.payload.get("keyword"),
-            "language": point.payload.get("language"),
-            "chunk_text": point.payload.get("chunk_text"),
-            "chunk_index": point.payload.get("chunk_index"),
+            # PDF chunks have no "language" field; default to Indonesian.
+            "language": point.payload.get("language") or "id",
+            # PDF chunks (pdf_ingestor.py) store their text under "content", not "chunk_text".
+            "chunk_text": point.payload.get("chunk_text") or point.payload.get("content"),
+            # PDF chunks store the index as "chunk_idx". Not `or`: index 0 is falsy.
+            "chunk_index": point.payload["chunk_index"] if "chunk_index" in point.payload else point.payload.get("chunk_idx"),
             "article_id": _hash_article_id(point.payload.get("article_id")),
         }
         for point in results.points

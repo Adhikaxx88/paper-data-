@@ -70,7 +70,8 @@ def retrieve(query: str, top_k: int = RETRIEVAL_TOP_K, category: Optional[str] =
 
     return [
         {
-            "chunk_text": point.payload.get("chunk_text"),
+            # PDF chunks (pdf_ingestor.py) store their text under "content", not "chunk_text".
+            "chunk_text": point.payload.get("chunk_text") or point.payload.get("content"),
             "title": point.payload.get("title"),
             "source": point.payload.get("source"),
             "date": point.payload.get("date"),
