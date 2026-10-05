@@ -23,6 +23,7 @@ Run with: python -m evaluation.evaluate
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -52,12 +53,19 @@ from config import (  # noqa: E402
 EVAL_DIR = Path(__file__).resolve().parent
 # Absolute paths so checkpoints land in the same place no matter which
 # directory this script is launched from.
-CHECKPOINT_FILE = EVAL_DIR / "checkpoint.json"
-RAG_CHECKPOINT_FILE = EVAL_DIR / "rag_outputs_checkpoint.json"
-DATASET_PATH = EVAL_DIR / "golden_dataset_openrouter.csv"
-RESULTS_PATH = EVAL_DIR / "results.csv"
-CHAT_API_BASE = "http://localhost:8000"
+# Overridable via env so a pilot run can use its own dataset and output folder
+# without touching the full run's checkpoints (e.g. EVAL_RUN_DIR=/app/evaluation/runs/pilot30).
+DATASET_PATH = Path(os.getenv("EVAL_DATASET_PATH", EVAL_DIR / "golden_dataset_openrouter.csv"))
+RUN_DIR = Path(os.getenv("EVAL_RUN_DIR", EVAL_DIR))
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+CHECKPOINT_FILE = RUN_DIR / "checkpoint.json"
+RAG_CHECKPOINT_FILE = RUN_DIR / "rag_outputs_checkpoint.json"
+RESULTS_PATH = RUN_DIR / "results.csv"
+CHAT_API_BASE = os.getenv("EVAL_CHAT_API_BASE", "http://localhost:8000")
 REQUEST_TIMEOUT = 300
+# Parallel workers for chat-API collection and DeepEval scoring. Default 1 keeps
+# the original sequential behaviour; raise it only after checking backend load.
+EVAL_MAX_WORKERS = max(1, int(os.getenv("EVAL_MAX_WORKERS", "1")))
 
 
 def save_checkpoint(results: list, idx: int):
@@ -127,7 +135,8 @@ def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
             rag_ckpt = json.load(f)
         logger.info(f"Resumed RAG checkpoint: {len(rag_ckpt)} questions already collected")
 
-    answers, contexts_list = [], []
+    results: list = [None] * len(df)
+    todo: list[tuple[int, str]] = []
     for i, question in enumerate(df["question"], start=1):
         q_key = str(i)
         cached = rag_ckpt.get(q_key)
@@ -135,29 +144,38 @@ def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
         # Index keys alone can't detect a reordered or regenerated dataset.
         if cached is not None and cached.get("question") == question:
             logger.info(f"[{i}/{len(df)}] Skipping (cached): {question!r}")
-            answers.append(cached["answer"])
-            contexts_list.append(cached["contexts"])
+            results[i - 1] = {"answer": cached["answer"], "contexts": cached["contexts"]}
             continue
         if cached is not None:
             logger.warning(f"[{i}/{len(df)}] Cache mismatch, re-querying: {question!r}")
+        todo.append((i, question))
 
-        logger.info(f"[{i}/{len(df)}] Querying chat API: {question!r}")
+    def _safe_query(question: str) -> tuple[dict[str, Any], bool]:
+        logger.info(f"Querying chat API: {question!r}")
         try:
-            result = query_chat_api(question)
+            return query_chat_api(question), True
         except requests.RequestException as e:
             logger.error(f"Chat API call failed for {question!r}: {e}")
-            result = {"answer": "", "contexts": []}
+            return {"answer": "", "contexts": []}, False
 
-        answers.append(result["answer"])
-        contexts_list.append(result["contexts"])
-
-        rag_ckpt[q_key] = {"question": question, **result}
-        with open(RAG_CHECKPOINT_FILE, "w") as f:
-            json.dump(rag_ckpt, f)
+    # ex.map yields in input order, so checkpoint writes stay sequential and the
+    # resume prefix stays valid even when queries complete out of order.
+    with ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS) as ex:
+        for (i, question), (result, ok) in zip(
+            todo, ex.map(_safe_query, [q for _, q in todo])
+        ):
+            results[i - 1] = result
+            # Failed calls are not checkpointed, so a resume re-queries them
+            # instead of freezing an empty answer into the run.
+            if not ok:
+                continue
+            rag_ckpt[str(i)] = {"question": question, **result}
+            with open(RAG_CHECKPOINT_FILE, "w") as f:
+                json.dump(rag_ckpt, f)
 
     df = df.copy()
-    df["answer"] = answers
-    df["contexts"] = contexts_list
+    df["answer"] = [r["answer"] for r in results]
+    df["contexts"] = [r["contexts"] for r in results]
     return df
 
 
@@ -267,8 +285,10 @@ def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
         df: Rows with question, answer, contexts.
 
     Returns:
-        Series of hallucination scores (0 = fully grounded, 1 = fully
-        hallucinated), indexed like df.
+        Series named "hallucination_grounded", indexed like df. Higher is better:
+        the fraction of the answer's claims that the retrieved contexts support
+        (deepeval 4.x scores YES = factual alignment, and passes when score >=
+        threshold). 1 = fully grounded, 0 = no claim supported. None = not scored.
     """
     from deepeval.metrics import HallucinationMetric
     from deepeval.models import DeepEvalBaseLLM
@@ -300,34 +320,38 @@ def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
             return self.model
 
     judge = OpenRouterJudge(JUDGE_MODEL)
-    metric = HallucinationMetric(model=judge, threshold=0.5)
 
-    # DeepEval fails per row, not per run, so a failed row is recorded as None
-    # and the run continues. The totals are logged at the end so failures
-    # stay visible in the aggregate, not only in per-row logs.
-    scores = []
-    failed = 0
-    skipped = 0
-    for i, row in enumerate(df.itertuples(), start=1):
+    def _score_row(args: tuple[int, Any]) -> tuple[float | None, str]:
+        i, row = args
         if not row.contexts:
             logger.warning(f"[{i}/{len(df)}] No retrieved contexts; skipping hallucination check")
-            scores.append(None)
-            skipped += 1
-            continue
+            return None, "skipped"
+        # A fresh metric per row: HallucinationMetric keeps verdicts and score
+        # on the instance, so sharing one across worker threads would race.
+        metric = HallucinationMetric(model=judge, threshold=0.5)
         test_case = LLMTestCase(input=row.question, actual_output=row.answer, context=row.contexts)
         try:
             metric.measure(test_case)
-            scores.append(metric.score)
+            return metric.score, "scored"
         except Exception as e:
             logger.error(f"[{i}/{len(df)}] DeepEval hallucination check failed: {e}")
-            scores.append(None)
-            failed += 1
+            return None, "failed"
 
+    # DeepEval fails per row, not per run, so a failed row is recorded as None
+    # and the run continues. ex.map keeps results in row order, so the Series
+    # lines up with df. Totals are logged at the end so failures stay visible.
+    with ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS) as ex:
+        outcomes = list(ex.map(_score_row, enumerate(df.itertuples(), start=1)))
+
+    scores = [score for score, _ in outcomes]
+    statuses = [status for _, status in outcomes]
+    failed = statuses.count("failed")
+    skipped = statuses.count("skipped")
     logger.warning(
         f"DeepEval summary: {failed} failed, {skipped} skipped (no contexts), "
         f"{len(df) - failed - skipped} scored, out of {len(df)} rows"
     )
-    return pd.Series(scores, index=df.index, name="hallucination")
+    return pd.Series(scores, index=df.index, name="hallucination_grounded")
 
 
 def print_summary(df: pd.DataFrame) -> None:
@@ -336,13 +360,13 @@ def print_summary(df: pd.DataFrame) -> None:
     Args:
         df: Merged results DataFrame.
     """
-    metric_cols = ["faithfulness", "answer_relevancy", "context_precision", "context_recall", "hallucination"]
-    print("\n=== Evaluation summary (mean scores) ===")
+    metric_cols = ["faithfulness", "answer_relevancy", "context_precision", "context_recall", "hallucination_grounded"]
+    print("\n=== Evaluation summary (mean scores, higher = better for all metrics) ===")
     print(f"generator_model      {RAG_GENERATOR_MODEL}  (provider: {RAG_GENERATOR_PROVIDER or 'unpinned'})")
     print(f"judge_model          {JUDGE_MODEL}  (provider: {JUDGE_PROVIDER or 'unpinned'})")
     for col in metric_cols:
         if col in df.columns:
-            print(f"{col:20s} {df[col].mean():.3f}   missing: {df[col].isna().sum()}/{len(df)}")
+            print(f"{col:24s} {df[col].mean():.3f}   missing: {df[col].isna().sum()}/{len(df)}")
 
     # Rows with any missing metric, so partial failures are visible in the aggregate.
     present = [c for c in metric_cols if c in df.columns]
@@ -372,7 +396,7 @@ def main() -> None:
     hallucination_scores = run_deepeval_hallucination(df)
 
     results = pd.concat([df.reset_index(drop=True), ragas_scores.reset_index(drop=True)], axis=1)
-    results["hallucination"] = hallucination_scores.reset_index(drop=True)
+    results["hallucination_grounded"] = hallucination_scores.reset_index(drop=True)
     # Record which models produced these numbers so runs stay comparable.
     results["generator_model"] = RAG_GENERATOR_MODEL
     results["generator_provider"] = RAG_GENERATOR_PROVIDER or "unpinned"
