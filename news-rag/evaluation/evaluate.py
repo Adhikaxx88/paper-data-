@@ -21,8 +21,12 @@ judge model names, and summary means are printed.
 Run with: python -m evaluation.evaluate
 """
 import json
+import math
 import os
+import random
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -66,6 +70,94 @@ REQUEST_TIMEOUT = 300
 # Parallel workers for chat-API collection and DeepEval scoring. Default 1 keeps
 # the original sequential behaviour; raise it only after checking backend load.
 EVAL_MAX_WORKERS = max(1, int(os.getenv("EVAL_MAX_WORKERS", "1")))
+
+# Retry policy. Row-level retry is only a fallback: RAGAS already retries
+# internally, and each row-level attempt repeats ~25 judge calls, so it stays at 2.
+ROW_MAX_ATTEMPTS = 2
+ROW_RETRY_WAIT = 5  # seconds before the retry, plus 0-30% jitter
+RAGAS_MAX_RETRIES = 3
+RAGAS_MAX_WAIT = 60
+CONSECUTIVE_FAILURE_LIMIT = 20
+FATAL_STATUS_CODES = {401, 402}  # bad key or no credits: stop at once
+METRIC_COLS = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+
+FAILED_ROWS: list[dict] = []
+_guard_lock = threading.Lock()
+_consecutive_failures = 0
+
+
+class EvalAborted(RuntimeError):
+    """Stops the whole run: a fatal status code or too many failures in a row."""
+
+
+def _status_code(exc: Exception) -> int | None:
+    for obj in (exc, getattr(exc, "response", None)):
+        code = getattr(obj, "status_code", None)
+        if isinstance(code, int):
+            return code
+    return None
+
+
+def _retry_after(exc: Exception) -> float | None:
+    """Seconds from a Retry-After header on the exception's response, if any."""
+    headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+    try:
+        return float(headers["Retry-After"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def with_retry(fn, label: str, max_attempts: int = ROW_MAX_ATTEMPTS):
+    """Run fn up to max_attempts times with jittered backoff; honours Retry-After."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except EvalAborted:
+            raise
+        except Exception as e:
+            code = _status_code(e)
+            if code in FATAL_STATUS_CODES:
+                raise EvalAborted(f"fatal HTTP {code} on {label}: {e}") from e
+            if attempt == max_attempts:
+                raise
+            wait = ROW_RETRY_WAIT
+            retry_after = _retry_after(e)
+            if retry_after is not None:
+                wait = max(wait, retry_after)
+            wait *= 1 + random.uniform(0, 0.30)
+            # The message carries the status (e.g. 429), so the cause is countable in the log.
+            logger.warning(
+                f"retry {attempt}/{max_attempts - 1} for {label}: "
+                f"{type(e).__name__}: {e}; sleeping {wait:.1f}s"
+            )
+            time.sleep(wait)
+
+
+def has_nan(record: dict, keys: list[str]) -> bool:
+    return any(record.get(k) is None or math.isnan(float(record[k])) for k in keys)
+
+
+def record_success() -> None:
+    global _consecutive_failures
+    with _guard_lock:
+        _consecutive_failures = 0
+
+
+def record_failure(phase: str, key, exc: Exception) -> None:
+    """Log a permanently failed row; abort the run after too many in a row."""
+    global _consecutive_failures
+    with _guard_lock:
+        FAILED_ROWS.append({"phase": phase, "key": str(key), "error": f"{type(exc).__name__}: {exc}"})
+        _consecutive_failures += 1
+        streak = _consecutive_failures
+    logger.error(f"FAILED after retries [{phase}] {key}: {exc} (consecutive: {streak})")
+    if streak >= CONSECUTIVE_FAILURE_LIMIT:
+        raise EvalAborted(f"{streak} consecutive failures; last was {phase} {key}")
+
+
+def write_failed_rows() -> None:
+    with open(RUN_DIR / "failed_rows.json", "w", encoding="utf-8") as f:
+        json.dump(FAILED_ROWS, f, ensure_ascii=False, indent=2)
 
 
 def save_checkpoint(results: list, idx: int):
@@ -120,6 +212,13 @@ def query_chat_api(question: str) -> dict[str, Any]:
     return {"answer": payload["answer"], "contexts": contexts}
 
 
+def _chat_once(question: str) -> dict[str, Any]:
+    result = query_chat_api(question)
+    if not result["answer"]:
+        raise ValueError("empty answer")
+    return result
+
+
 def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
     """Query the chat API for every golden question and attach the results.
 
@@ -153,17 +252,20 @@ def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
     def _safe_query(question: str) -> tuple[dict[str, Any], bool]:
         logger.info(f"Querying chat API: {question!r}")
         try:
-            return query_chat_api(question), True
-        except requests.RequestException as e:
-            logger.error(f"Chat API call failed for {question!r}: {e}")
+            result = with_retry(lambda: _chat_once(question), f"chat {question[:50]!r}")
+        except EvalAborted:
+            raise
+        except Exception as e:
+            record_failure("chat", question, e)
             return {"answer": "", "contexts": []}, False
+        record_success()
+        return result, True
 
     # ex.map yields in input order, so checkpoint writes stay sequential and the
     # resume prefix stays valid even when queries complete out of order.
-    with ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS) as ex:
-        for (i, question), (result, ok) in zip(
-            todo, ex.map(_safe_query, [q for _, q in todo])
-        ):
+    ex = ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS)
+    try:
+        for (i, question), (result, ok) in zip(todo, ex.map(_safe_query, [q for _, q in todo])):
             results[i - 1] = result
             # Failed calls are not checkpointed, so a resume re-queries them
             # instead of freezing an empty answer into the run.
@@ -172,6 +274,9 @@ def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
             rag_ckpt[str(i)] = {"question": question, **result}
             with open(RAG_CHECKPOINT_FILE, "w") as f:
                 json.dump(rag_ckpt, f)
+    finally:
+        # On abort, drop queued queries instead of waiting for all of them.
+        ex.shutdown(wait=True, cancel_futures=True)
 
     df = df.copy()
     df["answer"] = [r["answer"] for r in results]
@@ -241,38 +346,66 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
     start_idx = valid
 
     from ragas import RunConfig
-    run_config = RunConfig(max_workers=1, timeout=600, max_retries=3)
+    run_config = RunConfig(
+        max_workers=1, timeout=600, max_retries=RAGAS_MAX_RETRIES, max_wait=RAGAS_MAX_WAIT
+    )
 
+    # scored holds every row scored in this run, by index. The checkpoint grows
+    # only while no row has failed permanently. After a gap, later rows are kept
+    # in memory but not checkpointed, so the checkpoint stays a clean prefix and
+    # a resume re-scores from the gap.
+    scored: dict[int, dict] = dict(enumerate(all_results))
+    gap = False
     for idx, row in enumerate(dataset):
         if idx < start_idx:
             continue
 
-        result = evaluate(
-            Dataset.from_dict({k: [v] for k, v in row.items()}),
-            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-            llm=judge_llm,
-            embeddings=judge_embeddings,
-            # Surface judge/parse failures immediately instead of silently
-            # writing NaN rows. Temporary while the new judge model is validated.
-            raise_exceptions=True,
-            run_config=run_config,
-        )
+        def _score_once(row=row) -> dict:
+            result = evaluate(
+                Dataset.from_dict({k: [v] for k, v in row.items()}),
+                metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+                llm=judge_llm,
+                embeddings=judge_embeddings,
+                # Surface judge/parse failures as exceptions instead of silent NaN rows.
+                raise_exceptions=True,
+                run_config=run_config,
+            )
+            record = result.to_pandas().to_dict(orient="records")[0]
+            if has_nan(record, METRIC_COLS):
+                raise ValueError("NaN in RAGAS metrics")
+            return record
 
-        record = result.to_pandas().to_dict(orient="records")[0]
+        try:
+            record = with_retry(_score_once, f"ragas row {idx + 1}")
+        except EvalAborted:
+            raise
+        except Exception as e:
+            record_failure("ragas", idx + 1, e)
+            gap = True
+            continue
+        record_success()
         # Store the inputs next to the scores so the next run can verify them.
         record["user_input"] = row["user_input"]
         record["response"] = row["response"]
+        scored[idx] = record
+        if gap:
+            logger.warning(f"Row {idx + 1} scored but not checkpointed (an earlier row failed)")
+            continue
         all_results.append(record)
         save_checkpoint(all_results, idx)
         print(f"Saved checkpoint at idx {idx}")
 
-    final_df = pd.DataFrame(all_results)
+    if gap:
+        logger.warning(f"Checkpoint stopped at the first failed row; {len(all_results)} rows saved")
+
+    nan_row = {m: float("nan") for m in METRIC_COLS}
+    final_df = pd.DataFrame([scored.get(i, nan_row) for i in range(len(dataset))])
     print(final_df.mean(numeric_only=True))
 
     # Checkpoint is not deleted automatically.
     # Delete evaluation/checkpoint.json manually to start over.
 
-    return final_df[["faithfulness", "answer_relevancy", "context_precision", "context_recall"]]
+    return final_df[METRIC_COLS]
 
 
 def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
@@ -326,22 +459,35 @@ def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
         if not row.contexts:
             logger.warning(f"[{i}/{len(df)}] No retrieved contexts; skipping hallucination check")
             return None, "skipped"
-        # A fresh metric per row: HallucinationMetric keeps verdicts and score
-        # on the instance, so sharing one across worker threads would race.
-        metric = HallucinationMetric(model=judge, threshold=0.5)
         test_case = LLMTestCase(input=row.question, actual_output=row.answer, context=row.contexts)
-        try:
+
+        def _measure() -> float:
+            # A fresh metric per call: HallucinationMetric keeps verdicts and score
+            # on the instance, so sharing one across worker threads would race.
+            metric = HallucinationMetric(model=judge, threshold=0.5)
             metric.measure(test_case)
-            return metric.score, "scored"
+            if metric.score is None or math.isnan(metric.score):
+                raise ValueError("DeepEval returned no score")
+            return metric.score
+
+        try:
+            score = with_retry(_measure, f"deepeval row {i}")
+        except EvalAborted:
+            raise
         except Exception as e:
-            logger.error(f"[{i}/{len(df)}] DeepEval hallucination check failed: {e}")
+            record_failure("deepeval", i, e)
             return None, "failed"
+        record_success()
+        return score, "scored"
 
     # DeepEval fails per row, not per run, so a failed row is recorded as None
     # and the run continues. ex.map keeps results in row order, so the Series
     # lines up with df. Totals are logged at the end so failures stay visible.
-    with ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS) as ex:
+    ex = ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS)
+    try:
         outcomes = list(ex.map(_score_row, enumerate(df.itertuples(), start=1)))
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
 
     scores = [score for score, _ in outcomes]
     statuses = [status for _, status in outcomes]
@@ -375,6 +521,14 @@ def print_summary(df: pd.DataFrame) -> None:
 
 
 def main() -> None:
+    try:
+        _run_evaluation()
+    finally:
+        # Written even on abort, so the failures behind an abort are kept on disk.
+        write_failed_rows()
+
+
+def _run_evaluation() -> None:
     df = load_golden_dataset()
     if df.empty:
         logger.warning(f"{DATASET_PATH} is empty; nothing to evaluate")
