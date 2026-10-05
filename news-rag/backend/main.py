@@ -61,6 +61,9 @@ class HistoryResponse(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    # Evaluation-only: return the raw retrieved sources even when the UI
+    # would hide them, so RAGAS/DeepEval get the real contexts.
+    bypass_source_filter: bool = False
 
 
 class SourceOut(BaseModel):
@@ -243,7 +246,7 @@ def chat(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail=str(e))
 
     sources = []
-    if not _should_hide_sources(result["answer"], result["sources"]):
+    if request.bypass_source_filter or not _should_hide_sources(result["answer"], result["sources"]):
         sources = []
         for s in result["sources"]:
             clean_title = _clean_title(s["title"])

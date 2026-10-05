@@ -101,7 +101,8 @@ def query_chat_api(question: str) -> dict[str, Any]:
 
     chat_resp = requests.post(
         f"{CHAT_API_BASE}/api/chat",
-        json={"session_id": session_id, "message": question},
+        # Raw retrieved chunks, not the UI-filtered list (see _should_hide_sources).
+        json={"session_id": session_id, "message": question, "bypass_source_filter": True},
         timeout=REQUEST_TIMEOUT,
     )
     chat_resp.raise_for_status()
