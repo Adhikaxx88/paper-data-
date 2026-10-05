@@ -64,6 +64,7 @@ RUN_DIR = Path(os.getenv("EVAL_RUN_DIR", EVAL_DIR))
 RUN_DIR.mkdir(parents=True, exist_ok=True)
 CHECKPOINT_FILE = RUN_DIR / "checkpoint.json"
 RAG_CHECKPOINT_FILE = RUN_DIR / "rag_outputs_checkpoint.json"
+DEEPEVAL_CHECKPOINT_FILE = RUN_DIR / "deepeval_checkpoint.json"
 RESULTS_PATH = RUN_DIR / "results.csv"
 CHAT_API_BASE = os.getenv("EVAL_CHAT_API_BASE", "http://localhost:8000")
 REQUEST_TIMEOUT = 300
@@ -75,6 +76,9 @@ EVAL_MAX_WORKERS = max(1, int(os.getenv("EVAL_MAX_WORKERS", "1")))
 # internally, and each row-level attempt repeats ~25 judge calls, so it stays at 2.
 ROW_MAX_ATTEMPTS = 2
 ROW_RETRY_WAIT = 5  # seconds before the retry, plus 0-30% jitter
+# Collect (/api/chat) is cheap to repeat, so it gets more attempts than the judge rows.
+CHAT_MAX_ATTEMPTS = 4
+CHAT_RETRY_WAITS = [5, 15, 45]  # seconds before attempts 2, 3, 4; jitter applied on top
 RAGAS_MAX_RETRIES = 3
 RAGAS_MAX_WAIT = 60
 CONSECUTIVE_FAILURE_LIMIT = 20
@@ -107,8 +111,11 @@ def _retry_after(exc: Exception) -> float | None:
         return None
 
 
-def with_retry(fn, label: str, max_attempts: int = ROW_MAX_ATTEMPTS):
-    """Run fn up to max_attempts times with jittered backoff; honours Retry-After."""
+def with_retry(fn, label: str, max_attempts: int = ROW_MAX_ATTEMPTS, waits: list[float] | None = None):
+    """Run fn up to max_attempts times with jittered backoff; honours Retry-After.
+
+    waits[i] is the sleep before attempt i+2; without it, ROW_RETRY_WAIT is used.
+    """
     for attempt in range(1, max_attempts + 1):
         try:
             return fn()
@@ -120,7 +127,7 @@ def with_retry(fn, label: str, max_attempts: int = ROW_MAX_ATTEMPTS):
                 raise EvalAborted(f"fatal HTTP {code} on {label}: {e}") from e
             if attempt == max_attempts:
                 raise
-            wait = ROW_RETRY_WAIT
+            wait = waits[attempt - 1] if waits else ROW_RETRY_WAIT
             retry_after = _retry_after(e)
             if retry_after is not None:
                 wait = max(wait, retry_after)
@@ -135,6 +142,10 @@ def with_retry(fn, label: str, max_attempts: int = ROW_MAX_ATTEMPTS):
 
 def has_nan(record: dict, keys: list[str]) -> bool:
     return any(record.get(k) is None or math.isnan(float(record[k])) for k in keys)
+
+
+def _valid_score(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and not math.isnan(x)
 
 
 def record_success() -> None:
@@ -209,11 +220,20 @@ def query_chat_api(question: str) -> dict[str, Any]:
     payload = chat_resp.json()
 
     contexts = [s["content"] for s in payload["sources"] if s.get("content")]
-    return {"answer": payload["answer"], "contexts": contexts}
+    # Missing field = older backend without the flag, treated as not failed.
+    return {
+        "answer": payload["answer"],
+        "contexts": contexts,
+        "generation_failed": bool(payload.get("generation_failed", False)),
+    }
 
 
 def _chat_once(question: str) -> dict[str, Any]:
     result = query_chat_api(question)
+    # The backend returns the apology text with HTTP 200 on LLM errors; retry it
+    # instead of judging the apology as an answer.
+    if result["generation_failed"]:
+        raise RuntimeError("backend reported generation_failed=true")
     if not result["answer"]:
         raise ValueError("empty answer")
     return result
@@ -252,7 +272,12 @@ def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
     def _safe_query(question: str) -> tuple[dict[str, Any], bool]:
         logger.info(f"Querying chat API: {question!r}")
         try:
-            result = with_retry(lambda: _chat_once(question), f"chat {question[:50]!r}")
+            result = with_retry(
+                lambda: _chat_once(question),
+                f"chat {question[:50]!r}",
+                max_attempts=CHAT_MAX_ATTEMPTS,
+                waits=CHAT_RETRY_WAITS,
+            )
         except EvalAborted:
             raise
         except Exception as e:
@@ -360,6 +385,18 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
         if idx < start_idx:
             continue
 
+        if not row["response"] or not row["retrieved_contexts"]:
+            # Collect failed (empty answer, no contexts): not judged, so no fake 0.
+            # A NaN marker keeps the checkpoint prefix aligned with the dataset.
+            logger.warning(f"Row {idx + 1} skipped: collect failed, not judged")
+            marker = {m: float("nan") for m in METRIC_COLS}
+            marker.update(user_input=row["user_input"], response=row["response"], skipped=True)
+            scored[idx] = marker
+            if not gap:
+                all_results.append(marker)
+                save_checkpoint(all_results, idx)
+            continue
+
         def _score_once(row=row) -> dict:
             result = evaluate(
                 Dataset.from_dict({k: [v] for k, v in row.items()}),
@@ -454,10 +491,36 @@ def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
 
     judge = OpenRouterJudge(JUDGE_MODEL)
 
+    # Per-row checkpoint keyed by row index. An entry is reused only while its
+    # question and answer still match the dataset row, so a changed dataset is
+    # re-scored. Only valid numeric scores are stored; failures are retried on resume.
+    ds_ckpt: dict[str, dict] = {}
+    if os.path.exists(DEEPEVAL_CHECKPOINT_FILE):
+        with open(DEEPEVAL_CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        for i, row in enumerate(df.itertuples(), start=1):
+            entry = saved.get(str(i))
+            if entry and entry.get("question") == row.question and entry.get("answer") == row.answer and _valid_score(entry.get("score")):
+                ds_ckpt[str(i)] = entry
+    cached = {int(k): v["score"] for k, v in ds_ckpt.items()}
+    if cached:
+        logger.info(f"Resumed DeepEval checkpoint: {len(cached)} rows already scored")
+    ds_lock = threading.Lock()
+
+    def _save_deepeval(i: int, row: Any, score: float) -> None:
+        with ds_lock:
+            ds_ckpt[str(i)] = {"question": row.question, "answer": row.answer, "score": score}
+            tmp = DEEPEVAL_CHECKPOINT_FILE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(ds_ckpt, f, ensure_ascii=False)
+            os.replace(tmp, DEEPEVAL_CHECKPOINT_FILE)
+
     def _score_row(args: tuple[int, Any]) -> tuple[float | None, str]:
         i, row = args
-        if not row.contexts:
-            logger.warning(f"[{i}/{len(df)}] No retrieved contexts; skipping hallucination check")
+        if i in cached:
+            return cached[i], "cached"
+        if not row.answer or not row.contexts:
+            logger.warning(f"[{i}/{len(df)}] Collect failed (no answer/contexts); skipping hallucination check")
             return None, "skipped"
         test_case = LLMTestCase(input=row.question, actual_output=row.answer, context=row.contexts)
 
@@ -478,6 +541,7 @@ def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
             record_failure("deepeval", i, e)
             return None, "failed"
         record_success()
+        _save_deepeval(i, row, score)
         return score, "scored"
 
     # DeepEval fails per row, not per run, so a failed row is recorded as None
@@ -493,9 +557,10 @@ def run_deepeval_hallucination(df: pd.DataFrame) -> pd.Series:
     statuses = [status for _, status in outcomes]
     failed = statuses.count("failed")
     skipped = statuses.count("skipped")
+    reused = statuses.count("cached")
     logger.warning(
         f"DeepEval summary: {failed} failed, {skipped} skipped (no contexts), "
-        f"{len(df) - failed - skipped} scored, out of {len(df)} rows"
+        f"{reused} reused from checkpoint, {len(df) - failed - skipped - reused} scored, out of {len(df)} rows"
     )
     return pd.Series(scores, index=df.index, name="hallucination_grounded")
 
@@ -510,6 +575,10 @@ def print_summary(df: pd.DataFrame) -> None:
     print("\n=== Evaluation summary (mean scores, higher = better for all metrics) ===")
     print(f"generator_model      {RAG_GENERATOR_MODEL}  (provider: {RAG_GENERATOR_PROVIDER or 'unpinned'})")
     print(f"judge_model          {JUDGE_MODEL}  (provider: {JUDGE_PROVIDER or 'unpinned'})")
+    # Collect-failed rows have an empty answer and were never judged; they are excluded from the means.
+    collect_failed = int((df["answer"] == "").sum()) if "answer" in df.columns else 0
+    print(f"rows judged: {len(df) - collect_failed}/{len(df)}  "
+          f"(skipped, collect failed: {collect_failed}; means use only judged rows)")
     for col in metric_cols:
         if col in df.columns:
             print(f"{col:24s} {df[col].mean():.3f}   missing: {df[col].isna().sum()}/{len(df)}")
