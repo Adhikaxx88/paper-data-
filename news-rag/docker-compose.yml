@@ -101,6 +101,7 @@ services:
       POSTGRES_PORT: "5432"
     volumes:
       - ./evaluation:/app/evaluation
+      - ./data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
