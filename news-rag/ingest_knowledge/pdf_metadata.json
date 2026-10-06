@@ -1,0 +1,106 @@
+{
+  "WHO_Psychological_Self_Help.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "self_help",
+    "keyword": "psychological, self-help, depression, WHO, Step-by-Step",
+    "source": "WHO",
+    "published": "2026-06-01",
+    "url": "https://www.who.int/publications/i/item/9789240120785"
+  },
+  "WHO_Guideline_Mental_Health_for_Teacher.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "education",
+    "keyword": "teacher, school, mental health, guideline, promosi",
+    "source": "WHO",
+    "published": "2022-01-01",
+    "url": "https://iris.who.int/bitstream/handle/10665/367426/9789240064751-eng.pdf"
+  },
+  "WHO_Guideline_Mental_Health_for_Chidlren_and_Youngster.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "children_youth",
+    "keyword": "children, youngster, mental health, service guidance, UNICEF",
+    "source": "WHO & UNICEF",
+    "published": "2024-10-09",
+    "url": "https://www.who.int/publications/i/item/9789240100374"
+  },
+  "WHO_Guideline_Mental_Health_for_Adolescense.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "adolescent",
+    "keyword": "adolescent, remaja, mental health, promotive, preventive",
+    "source": "WHO",
+    "published": "2020-01-01",
+    "url": "https://www.who.int/docs/default-source/mental-health/guidelines-on-mental-health-promotive-and-preventive-interventions-for-adolescents-hat.pdf"
+  },
+  "WHO_Guideline_Mental_Health_at_work.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "workplace",
+    "keyword": "workplace, occupational, mental health, guidelines, ILO",
+    "source": "WHO",
+    "published": "2022-09-28",
+    "url": "https://www.who.int/publications/i/item/9789240053052"
+  },
+  "Pedoman-Pemberitaan-Terkait-Tindak-dan-Upaya-Bunuh-Diri-Dewan-Pers-22-Maret-2019.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "suicide_prevention",
+    "keyword": "bunuh diri, pemberitaan, media, dewan pers, jurnalistik",
+    "source": "Dewan Pers",
+    "published": "2019-03-22",
+    "url": "https://dewanpers.or.id/kebijakan/pedoman"
+  },
+  "Panduan-Pertolongan-Pertama-Pencegahan-Bunuh-Diri_v1.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "suicide_prevention",
+    "keyword": "bunuh diri, pencegahan, pertolongan pertama, psikologis, UGM",
+    "source": "CPMH UGM",
+    "published": "2020-10-17",
+    "url": "https://cpmh.psikologi.ugm.ac.id/2020/10/17/unduh-suicide-prevention-guidelines-for-indonesia/"
+  },
+  "Mental_Behavioural_Disorder_Category.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "diagnosis",
+    "keyword": "ICD-10, mental disorder, behavioural, klasifikasi, diagnostic guidelines",
+    "source": "WHO",
+    "published": "1992-01-01",
+    "url": "https://www.who.int/publications/i/item/9241544228"
+  },
+  "files1241Pedoman_Pelayanan_Kesehatan_Jiwa di FKTP [1].pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "primary_care",
+    "keyword": "FKTP, puskesmas, pelayanan, kesehatan jiwa, fasilitas",
+    "source": "Kemenkes",
+    "published": "2021-07-27",
+    "url": "https://promkes.kemkes.go.id/pub/files/files1241Pedoman_Pelayanan_Kesehatan_Jiwa%20di%20FKTP%20%5B1%5D.pdf"
+  },
+  "buku_pedoman_keswa_smp.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "education",
+    "keyword": "SMP, sekolah, kesehatan jiwa, remaja, juknis, UKS",
+    "source": "Kemenkes",
+    "published": null,
+    "url": null
+  },
+  "Buku pedoman tatakelola upaya keswa.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "governance",
+    "keyword": "tatakelola, manajemen, upaya, kesehatan jiwa, penyelenggaraan",
+    "source": "Kemenkes",
+    "published": "2021-01-01",
+    "url": "https://repository.kemkes.go.id/book/273"
+  },
+  "BUKU PEDOMAN SURVEILANS KESWA 29112022ISBN.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "surveillance",
+    "keyword": "surveilans, epidemiologi, monitoring, keswa, ISBN",
+    "source": "Kemenkes",
+    "published": "2022-11-29",
+    "url": null
+  },
+  "Buku JUKNIS P2 GANGGUAN MENTAL EMOSIONAL.pdf": {
+    "topic_category": "mental_health",
+    "sub_area": "emotional_disorder",
+    "keyword": "gangguan mental, emosional, juknis, pencegahan, pengendalian, P2",
+    "source": "Kemenkes",
+    "published": "2021-01-01",
+    "url": "https://repository.kemkes.go.id/book/1258"
+  }
+}

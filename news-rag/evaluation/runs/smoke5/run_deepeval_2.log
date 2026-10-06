@@ -1,0 +1,32 @@
+2026-10-05 15:57:13.194 | INFO     | __main__:load_golden_dataset:193 - Loaded 5 golden Q&A pairs from /app/evaluation/runs/smoke5/dataset_smoke5.csv
+2026-10-05 15:57:13.194 | WARNING  | __main__:_run_evaluation:611 - RAG generator provider is not pinned; set it in .env for a reproducible run
+2026-10-05 15:57:13.194 | WARNING  | __main__:_run_evaluation:611 - judge provider is not pinned; set it in .env for a reproducible run
+2026-10-05 15:57:13.200 | INFO     | __main__:collect_rag_outputs:255 - Resumed RAG checkpoint: 5 questions already collected
+2026-10-05 15:57:13.200 | INFO     | __main__:collect_rag_outputs:265 - [1/5] Skipping (cached): 'Kalau anak saya sudah terlanjur memiliki akun media sosial, apa yang harus saya lakukan?'
+2026-10-05 15:57:13.200 | INFO     | __main__:collect_rag_outputs:265 - [2/5] Skipping (cached): 'Berapa persen remaja di Indonesia yang menjadi pengguna narkoba?'
+2026-10-05 15:57:13.200 | INFO     | __main__:collect_rag_outputs:265 - [3/5] Skipping (cached): 'Apa itu desain layanan adiktif?'
+2026-10-05 15:57:13.200 | INFO     | __main__:collect_rag_outputs:265 - [4/5] Skipping (cached): 'Berapa persen orang dewasa di AS yang percaya bahwa media sosial memiliki dampak negatif pada negara?'
+2026-10-05 15:57:13.200 | INFO     | __main__:collect_rag_outputs:265 - [5/5] Skipping (cached): 'Berapa persen pelajar di Bandung yang terindikasi mengalami gangguan mental?'
+2026-10-05 15:57:13.201 | INFO     | __main__:_run_evaluation:615 - Running RAGAS metrics...
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/103 [00:00<?, ?it/s]Loading weights: 100%|██████████| 103/103 [00:00<00:00, 2474.57it/s]
+faithfulness         0.651546
+answer_relevancy     0.334029
+context_precision    0.413333
+context_recall       0.600000
+dtype: float64
+2026-10-05 15:57:36.514 | INFO     | __main__:_run_evaluation:618 - Running DeepEval HallucinationMetric...
+2026-10-05 15:57:36.947 | INFO     | __main__:run_deepeval_hallucination:507 - Resumed DeepEval checkpoint: 5 rows already scored
+2026-10-05 15:57:36.949 | WARNING  | __main__:run_deepeval_hallucination:561 - DeepEval summary: 0 failed, 0 skipped (no contexts), 5 reused from checkpoint, 0 scored, out of 5 rows
+2026-10-05 15:57:36.964 | INFO     | __main__:_run_evaluation:630 - Wrote 5 scored rows to /app/evaluation/runs/smoke5/results.csv
+
+=== Evaluation summary (mean scores, higher = better for all metrics) ===
+generator_model      deepseek/deepseek-chat-v3-0324  (provider: unpinned)
+judge_model          google/gemini-2.5-flash  (provider: unpinned)
+rows judged: 5/5  (skipped, collect failed: 0; means use only judged rows)
+faithfulness             0.652   missing: 0/5
+answer_relevancy         0.334   missing: 0/5
+context_precision        0.413   missing: 0/5
+context_recall           0.600   missing: 0/5
+hallucination_grounded   0.720   missing: 0/5
+rows with at least one missing metric: 0/5
