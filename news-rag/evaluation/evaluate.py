@@ -375,62 +375,77 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
         max_workers=1, timeout=600, max_retries=RAGAS_MAX_RETRIES, max_wait=RAGAS_MAX_WAIT
     )
 
-    # scored holds every row scored in this run, by index. The checkpoint grows
-    # only while no row has failed permanently. After a gap, later rows are kept
-    # in memory but not checkpointed, so the checkpoint stays a clean prefix and
-    # a resume re-scores from the gap.
+    def _score_once(row: dict) -> dict:
+        result = evaluate(
+            Dataset.from_dict({k: [v] for k, v in row.items()}),
+            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
+            llm=judge_llm,
+            embeddings=judge_embeddings,
+            # Surface judge/parse failures as exceptions instead of silent NaN rows.
+            raise_exceptions=True,
+            run_config=run_config,
+        )
+        record = result.to_pandas().to_dict(orient="records")[0]
+        if has_nan(record, METRIC_COLS):
+            raise ValueError("NaN in RAGAS metrics")
+        return record
+
+    # Rows are scored concurrently (EVAL_MAX_WORKERS threads), but the results
+    # are consumed in dataset order below, so checkpoint writes stay a clean
+    # prefix and the gap/abort logic is unchanged. Each row still gets its own
+    # with_retry, and only the main thread touches checkpoint and failure state.
     scored: dict[int, dict] = dict(enumerate(all_results))
-    gap = False
-    for idx, row in enumerate(dataset):
-        if idx < start_idx:
-            continue
+    def _is_scoreable(row: dict) -> bool:
+        return bool(row["response"]) and bool(row["retrieved_contexts"])
 
-        if not row["response"] or not row["retrieved_contexts"]:
-            # Collect failed (empty answer, no contexts): not judged, so no fake 0.
-            # A NaN marker keeps the checkpoint prefix aligned with the dataset.
-            logger.warning(f"Row {idx + 1} skipped: collect failed, not judged")
-            marker = {m: float("nan") for m in METRIC_COLS}
-            marker.update(user_input=row["user_input"], response=row["response"], skipped=True)
-            scored[idx] = marker
-            if not gap:
-                all_results.append(marker)
-                save_checkpoint(all_results, idx)
-            continue
+    ex = ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS)
+    futures: dict[int, Any] = {}
+    try:
+        for idx in range(start_idx, len(dataset)):
+            row = dataset[idx]
+            if _is_scoreable(row):
+                futures[idx] = ex.submit(
+                    with_retry, lambda row=row: _score_once(row), f"ragas row {idx + 1}"
+                )
 
-        def _score_once(row=row) -> dict:
-            result = evaluate(
-                Dataset.from_dict({k: [v] for k, v in row.items()}),
-                metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-                llm=judge_llm,
-                embeddings=judge_embeddings,
-                # Surface judge/parse failures as exceptions instead of silent NaN rows.
-                raise_exceptions=True,
-                run_config=run_config,
-            )
-            record = result.to_pandas().to_dict(orient="records")[0]
-            if has_nan(record, METRIC_COLS):
-                raise ValueError("NaN in RAGAS metrics")
-            return record
+        gap = False
+        for idx in range(start_idx, len(dataset)):
+            row = dataset[idx]
 
-        try:
-            record = with_retry(_score_once, f"ragas row {idx + 1}")
-        except EvalAborted:
-            raise
-        except Exception as e:
-            record_failure("ragas", idx + 1, e)
-            gap = True
-            continue
-        record_success()
-        # Store the inputs next to the scores so the next run can verify them.
-        record["user_input"] = row["user_input"]
-        record["response"] = row["response"]
-        scored[idx] = record
-        if gap:
-            logger.warning(f"Row {idx + 1} scored but not checkpointed (an earlier row failed)")
-            continue
-        all_results.append(record)
-        save_checkpoint(all_results, idx)
-        print(f"Saved checkpoint at idx {idx}")
+            if not _is_scoreable(row):
+                # Collect failed (empty answer, no contexts): not judged, so no fake 0.
+                # A NaN marker keeps the checkpoint prefix aligned with the dataset.
+                logger.warning(f"Row {idx + 1} skipped: collect failed, not judged")
+                marker = {m: float("nan") for m in METRIC_COLS}
+                marker.update(user_input=row["user_input"], response=row["response"], skipped=True)
+                scored[idx] = marker
+                if not gap:
+                    all_results.append(marker)
+                    save_checkpoint(all_results, idx)
+                continue
+
+            try:
+                record = futures[idx].result()
+            except EvalAborted:
+                raise
+            except Exception as e:
+                record_failure("ragas", idx + 1, e)
+                gap = True
+                continue
+            record_success()
+            # Store the inputs next to the scores so the next run can verify them.
+            record["user_input"] = row["user_input"]
+            record["response"] = row["response"]
+            scored[idx] = record
+            if gap:
+                logger.warning(f"Row {idx + 1} scored but not checkpointed (an earlier row failed)")
+                continue
+            all_results.append(record)
+            save_checkpoint(all_results, idx)
+            print(f"Saved checkpoint at idx {idx}")
+    finally:
+        # On abort, drop rows that have not started yet; running ones finish.
+        ex.shutdown(wait=True, cancel_futures=True)
 
     if gap:
         logger.warning(f"Checkpoint stopped at the first failed row; {len(all_results)} rows saved")
