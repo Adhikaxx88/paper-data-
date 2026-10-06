@@ -19,19 +19,19 @@ docker compose up -d postgres qdrant
 ```bash
 cd backend
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn main:app --reload --port 8686
 ```
 
-Or, on Windows, `backend\start.bat` runs the same command. This also works
+Or, on Windows, `backend\start.bat` runs the same command on port 8000 (see the note below). This also works
 as `uvicorn backend.main:app --reload` from the project root (what
 `docker-compose.yml`'s `backend` service does) — `backend/main.py` inserts
 the project root onto `sys.path` at import time so both entry points
 resolve `config`, `db`, `rag`, `vectorization`, and `backend.*` correctly.
 
-Serves at `http://localhost:8000`. Check it's healthy:
+Serves at `http://localhost:8686` (`--port 8686` above). Check it's healthy:
 
 ```bash
-curl http://localhost:8000/api/health
+curl http://localhost:8686/api/health
 ```
 
 ## 3. Start the frontend (dev)
@@ -43,12 +43,16 @@ npm run dev
 ```
 
 Or `frontend\start.bat` on Windows. Serves at `http://localhost:5173`,
-proxying `/api/*` to `http://localhost:8000` (`vite.config.ts`).
+proxying `/api/*` to `http://localhost:8686` (`vite.config.ts`).
+
+> **Port note:** `vite.config.ts` and `frontend/.env` target port 8686, but
+> `backend/start.bat` starts uvicorn on port 8000. Start the backend with
+> `--port 8686` (as above), or the `/api` proxy fails.
 
 ## 4. Open the app
 
 - Dev (`npm run dev` outside Docker): **http://localhost:5173**
-- Docker (`docker compose up backend frontend`): also **http://localhost:5173** — the
+- Docker (`docker compose up backend frontend`): **http://localhost:5888** (host port; the container listens on 5173) — the
   `frontend` service in `docker-compose.yml` runs the Vite dev server itself
   (`node:20-slim`, `npm run dev -- --host 0.0.0.0`), not a built/nginx-served
   bundle, so both paths land on the same port. See
@@ -69,7 +73,7 @@ source of truth for each value:
 | `GUARDRAIL_MODEL` | `openai/gpt-4o-mini` | `scope_check` and `language_detect` on every `/api/search` query |
 | `DATASET_GENERATOR_MODEL` | `openai/gpt-4o-mini` | `evaluation/generate_dataset.py` |
 | `JUDGE_MODEL` | `google/gemini-2.5-flash` | `evaluation/evaluate.py` (RAGAS and DeepEval) |
-| `QDRANT_URL` | `http://localhost:6333` | `config.py` → `vectorization/qdrant_store.py`, reused by `backend/retrieval/searcher.py` |
+| `QDRANT_URL` | `http://localhost:6335` (host) | `config.py` → `vectorization/qdrant_store.py`, reused by `backend/retrieval/searcher.py` |
 | `COLLECTION_NAME` | `data-paper-child` | Qdrant collection name (`config.QDRANT_COLLECTION`) |
 | `RETRIEVAL_TOP_K` | `5` | `config.py` → default `top_k` for `backend/retrieval/searcher.py:hybrid_search()` and `SearchRequest.top_k` |
 | `CONVERSATION_HISTORY_LIMIT` | `10` | `config.py` → caps the history window `backend/routers/search.py` passes into `run_input_guardrails()` |

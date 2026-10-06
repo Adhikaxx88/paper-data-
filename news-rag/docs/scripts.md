@@ -25,6 +25,28 @@ supported way to remove something (rather than deleting rows from
 PostgreSQL and Qdrant by hand and risking one store falling out of sync
 with the other).
 
+## `ingest_knowledge/pdf_ingestor.py`: manual PDF ingestion
+
+Ingests PDF files as knowledge-base chunks, outside the scraping pipeline.
+It extracts text per page (PyMuPDF, with OCR through `pytesseract` for pages
+without a text layer), removes header and footer noise, chunks the text, and
+writes each chunk to PostgreSQL and its dense vector to Qdrant.
+
+| Item | Value |
+|---|---|
+| Dense model | `DENSE_MODEL_NAME`, default `intfloat/multilingual-e5-large`, with the `passage: ` prefix |
+| Qdrant | `QDRANT_URL` (default `http://localhost:6335`), collection `COLLECTION_NAME` (default `data-paper-child`) |
+| PostgreSQL | `POSTGRES_HOST`, `POSTGRES_PORT` (script default `5433`), `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` |
+
+| Command | Effect |
+|---|---|
+| `python ingest_knowledge/pdf_ingestor.py --dry-run` | Previews the ingest. Writes nothing. |
+| `python ingest_knowledge/pdf_ingestor.py --file <name.pdf>` | Ingests one file, matched by filename. |
+| `python ingest_knowledge/pdf_ingestor.py` | Ingests every PDF it finds. |
+
+The chunks carry `source_type` `pdf_knowledge`, which is the same value the
+evaluation dataset uses for PDF-sourced questions.
+
 ## One-off data-fix scripts
 
 The rest were written to resolve specific data issues found in the

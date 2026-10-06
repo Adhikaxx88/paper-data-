@@ -1,0 +1,12 @@
+[
+  {
+    "phase": "ragas",
+    "key": "6",
+    "error": "RuntimeError: <asyncio.locks.Event object at 0x73104e2bbe10 [unset]> is bound to a different event loop"
+  },
+  {
+    "phase": "ragas",
+    "key": "8",
+    "error": "RuntimeError: <asyncio.locks.Event object at 0x7310781b0910 [unset]> is bound to a different event loop"
+  }
+]

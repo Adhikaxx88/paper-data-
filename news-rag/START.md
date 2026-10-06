@@ -6,7 +6,7 @@
 2. Start backend:
    cd backend
    pip install -r requirements.txt
-   uvicorn main:app --reload
+   uvicorn main:app --reload --port 8686
 
 3. Start frontend (dev):
    cd frontend

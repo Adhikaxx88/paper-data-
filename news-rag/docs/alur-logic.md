@@ -3,19 +3,19 @@ Oke, hapus dari dua tempat: PostgreSQL + Qdrant.
 Step 1 — Cari ID-nya dulu di PostgreSQL:
 
 bash
-docker exec -it <backend_container> psql -U postgres -d <dbname> -c \
+docker exec -it <backend_container> psql -U postgres -d <dbname> -c `
   "SELECT id, title, source FROM clean_articles WHERE title ILIKE '%myanmar%meth%' OR title ILIKE '%meth bust%';"
 
 Step 2 — Delete dari PostgreSQL:
 
 bash
-docker exec -it <backend_container> psql -U postgres -d <dbname> -c \
+docker exec -it <backend_container> psql -U postgres -d <dbname> -c `
   "DELETE FROM clean_articles WHERE title ILIKE '%myanmar%meth%';"
 
 (kalau ada raw_articles juga):
 
 bash
-docker exec -it <backend_container> psql -U postgres -d <dbname> -c \
+docker exec -it <backend_container> psql -U postgres -d <dbname> -c `
   "DELETE FROM raw_articles WHERE title ILIKE '%myanmar%meth%';"
 
 Step 3 — Delete chunk-nya dari Qdrant:

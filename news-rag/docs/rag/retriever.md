@@ -5,17 +5,16 @@
 ## Step-by-step: query → embed → search → fetch
 
 1. **Embed the query.** The user's question is embedded with the exact same
-   model used to embed chunks at indexing time (`EMBED_MODEL`, default
-   `BAAI/bge-large-en-v1.5` via infinity-emb), reusing
-   `pipeline.embedder.embed_text`. Using a different model here would make
+   model used to embed chunks at indexing time (`DENSE_MODEL_NAME`, default
+   `intfloat/multilingual-e5-large`), via `vectorization.embedder.encode_query`. Using a different model here would make
    the query vector incomparable to the stored chunk vectors. Because BGE
    uses different instruction prefixes for queries vs. passages, the query
    text is prefixed with `QUERY_PREFIX` ("Represent this question for
    searching relevant passages: ") before embedding — a different prefix
    than the `PASSAGE_PREFIX` used in the [embedder](../pipeline/embedder.md).
-2. **Search Qdrant.** `db.qdrant_client.search(query_vector, top_k)` runs a
-   cosine-similarity nearest-neighbor search over the `news_chunks`
-   collection and returns the top-K `chunk_id`s with their scores.
+2. **Search Qdrant.** `backend/retrieval/searcher.py:hybrid_search()` runs
+   dense and BM25 sparse search, fuses them with RRF, and reranks. See
+   [retrieval.md](../retrieval.md) for the current design.
 3. **Fetch from PostgreSQL.** The returned `chunk_id`s are passed to
    `db.postgres.get_chunks_by_ids`, which joins `chunks` and `articles` to
    return `chunk_text`, `title`, `source`, `date`, `category`, and `url`.

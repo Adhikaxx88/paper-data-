@@ -12,9 +12,8 @@ The rest of this page covers running each piece manually without Docker.
 - Python 3.10+
 - A running PostgreSQL instance
 - A running Qdrant instance (local via Docker, or Qdrant Cloud)
-- A local embedding server compatible with the OpenAI `/embeddings` API,
-  serving `BAAI/bge-large-en-v1.5` (e.g. infinity-emb) — see
-  [Embedder](pipeline/embedder.md)
+- No separate embedding server. The dense, sparse, and reranker models load
+  in-process (see [Embedder](pipeline/embedder.md)).
 - An OpenRouter API key (`OPENROUTER_API_KEY`) — see
   [Generator](rag/generator.md)
 - (Optional) A Google Cloud service account with Drive API access, if you
@@ -31,7 +30,7 @@ docker run -p 6333:6333 qdrant/qdrant
 ```bash
 git clone <this-repo>
 cd news-rag
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate   # PowerShell: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -51,14 +50,14 @@ cp .env.example .env
 | `GUARDRAIL_MODEL` | Cheap model for `scope_check` / `language_detect`, e.g. `openai/gpt-4o-mini`. Runs on every `/api/search` query. |
 | `DATASET_GENERATOR_MODEL` | Model that writes the golden Q&A dataset, e.g. `openai/gpt-4o-mini`. |
 | `JUDGE_MODEL` | Model that judges RAGAS and DeepEval metrics, e.g. `google/gemini-2.5-flash`. |
-| `QDRANT_URL` | Base URL of your Qdrant instance, e.g. `http://localhost:6333` (`http://qdrant:6333` under Docker Compose). |
+| `QDRANT_URL` | Base URL of your Qdrant instance, e.g. `http://localhost:6335` (`http://qdrant:6333` under Docker Compose). |
 | `QDRANT_API_KEY` | API key for Qdrant Cloud; leave empty for a local instance without auth. |
 | `GOOGLE_DRIVE_CREDENTIALS_PATH` | Path to a Google service account JSON key file, used by `pipeline/pdf_exporter.py`. |
 | `NEWS_KEYWORDS` | Comma-separated list of keywords/topics to scrape from Google News. Each keyword is also used as the article's `category`. |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` / `POSTGRES_HOST` / `POSTGRES_PORT` | Individual components used by both the `postgres` container in `docker-compose.yml` and `config.py`, which assembles them into the connection string (`POSTGRES_HOST` defaults to `127.0.0.1`, `POSTGRES_PORT` to `5432`; use `postgres` as the host under Docker Compose). |
-| `INFINITY_URL` | Base URL of the infinity-emb embedding server, e.g. `http://infinity:7997` under Docker Compose. |
-| `EMBED_MODEL` | Embedding model served by infinity-emb. Default `BAAI/bge-large-en-v1.5`. |
-| `EMBED_DIM` | Vector dimension of `EMBED_MODEL`, used to size the Qdrant collection. Default `1024` (BGE-large). Must match the model — see the warning in the [Docker section](#running-with-local-stack-docker) below if you change it. |
+| `DENSE_MODEL_NAME` | Dense embedding model, loaded in-process with sentence-transformers. Default `intfloat/multilingual-e5-large`. |
+| `SPARSE_MODEL_NAME` | BM25 sparse model, loaded in-process with fastembed. Default `Qdrant/bm25`. |
+| `EMBED_DIM` | Vector dimension of `DENSE_MODEL_NAME`, used to size the Qdrant collection. Default `1024`, the output size of `intfloat/multilingual-e5-large`. Must match the model — see the warning in the [Docker section](#running-with-local-stack-docker) below if you change it. |
 
 ## Initialize the database
 
@@ -95,7 +94,7 @@ service below.
 ## Running with Local Stack (Docker)
 
 This is the recommended way to run the whole system: PostgreSQL, Qdrant,
-infinity-emb (BGE embeddings), the batch pipeline, the FastAPI backend, and the
+the batch pipeline, the FastAPI backend, and the
 React frontend, all wired together by `docker-compose.yml`. LLM calls go to
 OpenRouter, so there is no LLM container.
 
@@ -104,7 +103,7 @@ OpenRouter, so there is no LLM container.
 - Docker + Docker Compose (v2)
 - An OpenRouter API key in `.env` (`OPENROUTER_API_KEY`)
 - **At least 16GB RAM** available to Docker. Rough footprint:
-  - BGE-large-en-v1.5 (infinity-emb): ~1.3GB
+  - `intfloat/multilingual-e5-large` (sentence-transformers, downloaded on first use)
   - PostgreSQL + Qdrant + backend/frontend: ~2GB
   - Leaves headroom for the embedding and reranking models
 
@@ -113,8 +112,8 @@ OpenRouter, so there is no LLM container.
 ```bash
 cp .env.example .env   # set OPENROUTER_API_KEY, POSTGRES_*, keywords, etc.
 
-# 1. Bring up the data + embedding layer
-docker compose up -d postgres qdrant infinity
+# 1. Bring up the data layer
+docker compose up -d postgres qdrant
 
 # 2. Run the batch pipeline once to scrape + index articles
 docker compose run pipeline python run_pipeline.py
@@ -125,11 +124,11 @@ docker compose up backend frontend
 
 ### How to access
 
-Open the chatbot at **`http://localhost:5173`**. The `frontend` service
+Open the chatbot at **`http://localhost:5888`**. The `frontend` service
 runs the Vite dev server directly inside the container (`node:20-slim`,
 `npm run dev -- --host 0.0.0.0`) rather than a built/nginx-served bundle, so
-Docker and local `npm run dev` land on the same port. The FastAPI backend
-is reachable directly at `http://localhost:8000` (e.g. `GET /docs` for the
+the container port 5173 is published as host port 5888. Local `npm run dev`
+uses 5173. The FastAPI backend is published at `http://localhost:8686` (e.g. `GET /docs` for the
 OpenAPI schema).
 
 ### Re-running the pipeline later
@@ -162,13 +161,13 @@ model whose answers are being scored, follow the checkpoint reset steps in
 
 !!! warning
     Qdrant collections have a fixed vector dimension. Switching
-    `EMBED_MODEL` to a model with a different `EMBED_DIM` **will** cause
+    `DENSE_MODEL_NAME` to a model with a different `EMBED_DIM` **will** cause
     dimension-mismatch errors until the collection is recreated.
 
 ```bash
-# 1. Update EMBED_MODEL / EMBED_DIM in .env to match the new model
+# 1. Update DENSE_MODEL_NAME / EMBED_DIM in .env to match the new model
 # 2. Drop and recreate the Qdrant collection at the new dimension
-docker compose run backend python -c "from db.qdrant_client import recreate_collection; recreate_collection()"
+docker compose run backend python -c "from vectorization.qdrant_store import recreate_collection; recreate_collection()"
 # 3. Re-embed everything (PostgreSQL text/article data is untouched and reused)
 docker compose run pipeline python run_pipeline.py --step embed
 ```
@@ -192,7 +191,7 @@ See [evaluation.md](evaluation.md) for the full walkthrough. Short version:
 # Generate the golden Q&A dataset (inside Docker)
 docker compose run evaluation python evaluation/generate_dataset.py
 
-# Score the chatbot against it (outside Docker — hits localhost:8000)
+# Score the chatbot against it (from the host; EVAL_CHAT_API_BASE sets the backend URL)
 python -m evaluation.evaluate
 ```
 
@@ -213,15 +212,15 @@ scripts in `scripts/`.
 
 The FastAPI backend (`backend/main.py`) must be running for the frontend to
 have anything to talk to — either via Docker (`docker compose up -d postgres
-qdrant infinity && docker compose up backend`) or locally
-(`uvicorn backend.main:app --reload`).
+qdrant && docker compose up backend`) or locally
+(`uvicorn backend.main:app --reload --port 8686`).
 
 Then, for hot-reloading frontend development outside Docker:
 
 ```bash
 cd frontend
 npm install
-npm run dev    # http://localhost:5173, proxies /api to :8000
+npm run dev    # http://localhost:5173, proxies /api to :8686
 ```
 
 See [Frontend](frontend.md) for the component structure and how the UI talks

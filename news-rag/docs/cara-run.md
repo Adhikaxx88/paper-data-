@@ -116,9 +116,9 @@ python sync_reviewed.py
 docker compose up -d backend frontend
 ```
 
-- Backend (FastAPI) tersedia di `http://localhost:8000`.
+- Backend (FastAPI) tersedia di `http://localhost:8686`.
 - Frontend (Vite dev server, dijalankan langsung di dalam container) tersedia
-  di `http://localhost:5173`.
+  di `http://localhost:5888`.
 
 Alternatif chatbot berbasis Streamlit (tanpa Docker):
 
@@ -138,7 +138,7 @@ docker compose run evaluation python evaluation/generate_dataset.py
 ```
 
 Lalu skor chatbot terhadap dataset itu (selalu dari **luar** Docker, karena
-memanggil backend lewat `http://localhost:8000`). Judge yang dipakai:
+memanggil backend lewat `http://localhost:8686`). Judge yang dipakai:
 `JUDGE_MODEL`:
 
 ```bash
