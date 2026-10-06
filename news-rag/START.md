@@ -13,7 +13,7 @@
    npm install
    npm run dev
 
-4. Open http://localhost:5173 (dev) or http://localhost:3000 (Docker)
+4. Open http://localhost:5173 (dev) or http://localhost:5888 (Docker)
 
 ## .env additions needed:
 OPENROUTER_API_KEY=your-openrouter-key

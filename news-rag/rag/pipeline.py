@@ -26,9 +26,9 @@ def ask(question: str, session_id: uuid.UUID) -> dict[str, Any]:
     postgres.insert_message(session_id, "user", question)
 
     chunks = retrieve(question)
-    answer = generate_answer(question, chunks, history)
+    answer, generation_failed = generate_answer(question, chunks, history)
 
     postgres.insert_message(session_id, "assistant", answer)
     logger.info(f"Session {session_id}: answered question with {len(chunks)} sources")
 
-    return {"answer": answer, "sources": chunks}
+    return {"answer": answer, "sources": chunks, "generation_failed": generation_failed}

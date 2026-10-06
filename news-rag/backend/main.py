@@ -34,7 +34,7 @@ app = FastAPI(title="News RAG Chatbot API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:5888", "http://127.0.0.1:5888"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -177,6 +177,8 @@ def _should_hide_sources(answer: str, raw_sources: list[dict]) -> bool:
 class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceOut]
+    # True when the LLM call failed and `answer` is the apology text, not a real answer.
+    generation_failed: bool = False
 
 
 @app.post("/api/session", response_model=SessionResponse)
@@ -266,7 +268,11 @@ def chat(request: ChatRequest) -> ChatResponse:
                     content=s["chunk_text"] or "",
                 )
             )
-    return ChatResponse(answer=result["answer"], sources=sources)
+    return ChatResponse(
+        answer=result["answer"],
+        sources=sources,
+        generation_failed=result.get("generation_failed", False),
+    )
 
 
 if __name__ == "__main__":

@@ -75,7 +75,7 @@ def build_messages(
     return messages
 
 
-def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[dict[str, str]]) -> str:
+def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[dict[str, str]]) -> tuple[str, bool]:
     """Call the RAG generator model on OpenRouter to produce an answer grounded in the retrieved context.
 
     Args:
@@ -84,7 +84,8 @@ def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[d
         history: Prior conversation turns for multi-turn continuity.
 
     Returns:
-        The generated answer text.
+        (answer text, generation_failed). On an LLM error the apology text is
+        returned as the answer with generation_failed=True.
     """
     messages = build_messages(question, chunks, history)
     try:
@@ -94,7 +95,7 @@ def generate_answer(question: str, chunks: list[dict[str, Any]], history: list[d
             temperature=0.2,
             extra_body=provider_body(RAG_GENERATOR_PROVIDER),
         )
-        return response.choices[0].message.content or ""
+        return response.choices[0].message.content or "", False
     except Exception as e:
         logger.error(f"LLM generation failed: {e}")
-        return "Maaf, terjadi kesalahan saat menghasilkan jawaban. Silakan coba lagi."
+        return "Maaf, terjadi kesalahan saat menghasilkan jawaban. Silakan coba lagi.", True
