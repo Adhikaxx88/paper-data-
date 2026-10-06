@@ -7,7 +7,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api': 'http://localhost:8000',
+      '/api': 'http://localhost:8686',
     },
     // Bind-mounting a Windows drive (/mnt/c/...) through WSL2 into a Docker
     // container drops inotify events, so chokidar's default watcher never
