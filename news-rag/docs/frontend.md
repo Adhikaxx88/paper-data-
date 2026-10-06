@@ -34,7 +34,7 @@ App
   /api/session`) and `sendChatMessage(sessionId, message)` (`POST
   /api/chat`), plus the `SourceItem`/`ChatResponse` types mirroring the
   backend's `SourceOut`/`ChatResponse` Pydantic models. Reads the API base
-  URL from `VITE_API_URL`, defaulting to `http://localhost:8000`.
+  URL from `VITE_API_URL`, defaulting to `http://localhost:8686`.
 - **`types/chat.ts`** — the `ChatMessage` UI type (`id`, `role`, `content`,
   `timestamp`, optional `sources`/`error`), distinct from the API's
   `ChatResponse`/`SourceItem` types in `api/chat.ts`.
@@ -105,7 +105,7 @@ submitting.
 
 The UI defaults to a **light** theme and switches to dark only if
 `prefers-color-scheme: dark` matches on first load (`App.tsx`'s `dark`
-state initializer). A `🌙`/`☀` button in the header flips that `dark`
+state initializer). A moon/sun toggle button in the header flips that `dark`
 boolean, toggling the `dark` class on `document.documentElement`. The
 toggle is UI-only state — it is not persisted across reloads (unlike
 session id).
@@ -128,17 +128,17 @@ npm run dev
 ```
 
 Opens at `http://localhost:5173`. `vite.config.ts` proxies `/api/*` to
-`http://localhost:8000`, so run the FastAPI backend separately alongside
+`http://localhost:8686`, so run the FastAPI backend separately alongside
 `npm run dev` — see [quickstart.md](quickstart.md).
 
 ## Production / Docker
 
 The `frontend` service in `docker-compose.yml` currently runs the Vite dev
 server itself inside the container (`node:20-slim` image, `npm install &&
-npm run dev -- --host 0.0.0.0`), publishing port `5173` — **not** the
+npm run dev -- --host 0.0.0.0`), publishing container port 5173 as host port `5888` — **not** the
 built static bundle. `frontend/Dockerfile` (multi-stage build → nginx,
 `frontend/nginx.conf` proxying `/api/` to `backend:8000`) still exists and
 works if built/run directly, but `docker-compose.yml` does not currently
 reference it. `docker compose up backend frontend` therefore serves the
 same dev-mode UI as running `npm run dev` locally, at
-`http://localhost:5173`.
+`http://localhost:5888`.

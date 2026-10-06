@@ -1,138 +1,209 @@
 # Evaluation
 
-`evaluation/` has two scripts: one generates a golden Q&A dataset from the
-scraped articles, the other replays that dataset through the live chatbot
-and scores the results with RAGAS and DeepEval.
+`evaluation/` has two scripts. `generate_dataset.py` builds a golden Q&A
+dataset from the stored articles. `evaluate.py` replays that dataset through
+the chatbot's HTTP API and scores the answers with RAGAS and DeepEval.
 
-Three roles use three different models, all served through OpenRouter. Keeping
-them separate avoids a model grading its own output and makes the setup easy
-to describe in the paper:
+## Models per role
+
+Three roles use three models, all served through OpenRouter. Keeping them
+separate avoids a model grading its own output.
 
 | Role | Config variable | Default model | Used by |
 |---|---|---|---|
-| Dataset generator | `DATASET_GENERATOR_MODEL` | `openai/gpt-4o-mini` | `generate_dataset.py` |
+| Dataset generator | `DATASET_GENERATOR_MODEL` | `openai/gpt-4o-mini` | `evaluation/generate_dataset.py` |
 | RAG generator (system under test) | `RAG_GENERATOR_MODEL` | `deepseek/deepseek-chat-v3-0324` | `rag/generator.py`, `/api/chat`, `/api/search` |
-| Judge (RAGAS + DeepEval) | `JUDGE_MODEL` | `google/gemini-2.5-flash` | `evaluate.py` |
+| Judge (RAGAS and DeepEval) | `JUDGE_MODEL` | `google/gemini-2.5-flash` | `evaluation/evaluate.py` |
 
-Each `results.csv` row carries `generator_model`, `generator_provider`,
-`judge_model`, and `judge_provider` columns, so every reported number can be
-traced back to the model and the provider that served it. The dataset file has
-`dataset_model` and `dataset_provider` columns for the same reason.
+`answer_relevancy` embeds text locally with `sentence-transformers/all-MiniLM-L6-v2`.
+No other model is used for scoring.
 
-**Provider pinning.** OpenRouter may serve the same model slug from several
-hosts, and each host can differ in quantization, speed, and behavior. Each role
-therefore sets a provider slug (`RAG_GENERATOR_PROVIDER`, `JUDGE_PROVIDER`,
-`DATASET_GENERATOR_PROVIDER`, `GUARDRAIL_PROVIDER`) that is sent as OpenRouter's
-`provider.order` with `allow_fallbacks: false`. If the pinned host is down, the
-request fails rather than silently moving to another host. An empty value means
-"unpinned", which is recorded as `unpinned` in the CSV and logged as a warning.
+**Provider pinning.** Each role has a provider slug (`DATASET_GENERATOR_PROVIDER`,
+`RAG_GENERATOR_PROVIDER`, `JUDGE_PROVIDER`, `GUARDRAIL_PROVIDER`). A non-empty
+slug is sent as OpenRouter's `provider.order` with `allow_fallbacks: false`
+(`config.py:provider_body`), so a request fails instead of moving to another
+host. An empty value means unpinned. `evaluate.py` logs a warning for an
+unpinned role.
 
-**Guardrail model (not an evaluation role).** `GUARDRAIL_MODEL` runs
-`scope_check` and `language_detect` in `/api/search`. `evaluate.py` calls
-`/api/chat`, which does not run these guardrails, so the guardrail model does
-not affect RAGAS or DeepEval scores directly. Its only effect is which queries
-reach the system. Report it separately in the methodology.
+**Guardrail model.** `GUARDRAIL_MODEL` runs `scope_check` and `language_detect`
+in `/api/search` only. `/api/chat` does not run these guardrails, so the
+guardrail model does not change RAGAS or DeepEval scores.
 
-## `generate_dataset.py` — building the golden dataset
+Every `results.csv` row carries `generator_model`, `generator_provider`,
+`judge_model`, and `judge_provider`. The dataset CSV carries `dataset_model`
+and `dataset_provider`.
 
-Samples up to `ARTICLES_PER_SOURCE` (5) of the longest `clean_articles`
-rows per distinct `source`, capped at `MAX_ARTICLES_TOTAL` (50) overall, and
-asks `DATASET_GENERATOR_MODEL` to write 2-3 Indonesian question/answer pairs
-per article — mixing factual, practical, situational, and statistical
-question phrasings, and instructed to answer strictly from the article's own
-content. The model is asked for a JSON object `{"pairs": [...]}`
-(`response_format: json_object`), and a plain-text `Q:/A:` fallback parser
-handles models that ignore the format.
+## `generate_dataset.py`: building the golden dataset
 
-Output is written to `evaluation/golden_dataset_openrouter.csv` with columns
-`question, ground_truth, article_id, source_title, source, dataset_model`.
-The earlier Ollama-generated `golden_dataset.csv` is kept for comparison.
+Reads every row of `clean_articles` (both `web_scraping` and `pdf_knowledge`
+sources) and asks `DATASET_GENERATOR_MODEL` for Q&A pairs in Indonesian. The
+prompt asks for answers drawn strictly from the article text.
 
-Run it inside Docker (needs PostgreSQL and `OPENROUTER_API_KEY` in `.env`):
+| Constant | Value | Effect |
+|---|---|---|
+| `TARGET_TOTAL_QUESTIONS` | `2500` | Total pairs. Quotas per `topic_category` are proportional to article counts. |
+| `MIN_CONTENT_LENGTH` | `500` | Shorter articles are skipped. |
+| `EXCLUDED_CATEGORIES` | `{"additional"}` | Categories left out of the dataset. |
+| `REQUEST_DELAY_SEC` | `0.75` | Fixed delay between calls. |
+| `MAX_RETRIES` / `BACKOFF_BASE_SEC` | `4` / `2` | Exponential backoff on HTTP 429. |
+
+The model returns `{"pairs": [...]}` (`response_format: json_object`). A plain
+`Q:` / `A:` text parser handles models that ignore the format.
+
+Output: `evaluation/golden_dataset_openrouter.csv` with columns `question,
+ground_truth, article_id, source_title, source, topic_category, source_type,
+dataset_model, dataset_provider`. The earlier Ollama dataset
+`golden_dataset.csv` is kept for comparison.
+
+| Command | Effect |
+|---|---|
+| `docker compose run evaluation python evaluation/generate_dataset.py` | Generates the dataset inside Docker. Needs PostgreSQL and `OPENROUTER_API_KEY`. |
+| `python evaluation/generate_dataset.py --local` | Loads `evaluation/.env.local` (localhost-mapped ports). Also used automatically when the `postgres` hostname does not resolve. |
+| `python evaluation/generate_dataset.py --plan-only` | Prints the distribution and cost estimate. Makes no API calls. |
+
+## `evaluate.py`: scoring the chatbot
+
+Entry point: `python -m evaluation.evaluate`. It runs from the host or in
+the `evaluation` compose service, as long as the backend is reachable at
+`EVAL_CHAT_API_BASE`.
+
+### Pipeline
+
+1. **Collect.** For each row in the dataset, `query_chat_api()` opens a new
+   session (`POST /api/session`) and asks the question (`POST /api/chat`).
+   A new session per question keeps earlier rows out of the conversation
+   history. The `answer` and the `content` of every returned source (as
+   `contexts`) are kept.
+2. **RAGAS.** `run_ragas()` scores `faithfulness`, `answer_relevancy`,
+   `context_precision`, and `context_recall` (see below).
+3. **DeepEval.** `run_deepeval_hallucination()` runs `HallucinationMetric`
+   once per row (see below).
+4. **Write.** RAGAS scores, DeepEval scores, and the metadata columns are
+   merged into `results.csv`, and the mean of each metric is printed.
+
+Steps 2 to 4 run only after step 1 has finished for every row.
+
+### RAGAS metrics
+
+| Metric | Reference needed | What it measures |
+|---|---|---|
+| `faithfulness` | no | Whether the answer's claims follow from the retrieved contexts. |
+| `answer_relevancy` | no | Whether the answer addresses the question. Uses local embeddings. |
+| `context_precision` | yes (`ground_truth`) | Whether the retrieved contexts are relevant to the reference answer. |
+| `context_recall` | yes (`ground_truth`) | Whether the retrieved contexts contain what the reference answer needs. |
+
+- Judge: `JUDGE_MODEL` through `langchain_openai.ChatOpenAI`, `temperature=0`,
+  with `JUDGE_PROVIDER` pinned.
+- `RunConfig`: `max_workers=1`, `timeout=600`, `max_retries=3`, `max_wait=60`.
+- `raise_exceptions=True`, so a judge or parse error is an exception, not a
+  silent NaN.
+- **Parallel rows.** Rows are scored by a process pool of `EVAL_MAX_WORKERS`
+  worker processes (`spawn` start method). Each process runs one row at a time
+  on its main thread, with a fresh judge LLM and fresh metric objects per row.
+  Thread-based parallelism failed in testing (`asyncio` event-loop errors, and
+  `LLM is not set` from shared metric state), so the process pool is the
+  supported path.
+- **Retry.** `with_retry()` wraps each row: 2 attempts, 5 s wait with up to 30%
+  jitter. HTTP 401 and 402 stop the run at once (`EvalAborted`). After 20
+  consecutive permanent failures the run stops too.
+
+### Row handling in RAGAS
+
+| Case | Stored in `checkpoint.json` | Metrics |
+|---|---|---|
+| Scored | yes, with `user_input` and `response` | numbers |
+| Collect failed (empty answer or no contexts) | yes, with `skipped: true` | NaN, not judged |
+| Permanent failure after retries | no | NaN in the final frame; logged in `failed_rows.json` |
+
+Scores that are NaN are never written to the checkpoint. After a permanent
+failure, later rows are still scored and kept in memory, but they are not
+written to `checkpoint.json` until the run is resumed. A resume therefore
+re-scores from the first failed row onward.
+
+### DeepEval `hallucination_grounded`
+
+- `HallucinationMetric(model=judge, threshold=0.5)`, judged by `JUDGE_MODEL`
+  through the `OpenRouterJudge` adapter (`DeepEvalBaseLLM`).
+- The column is named `hallucination_grounded`. Per the code docstring, higher
+  is better and 1 means the answer is fully grounded in the contexts.
+- Rows with no contexts get `None` and are not judged.
+- Failures are per row: a failed row becomes `None`, and the run continues.
+  The log ends with a `DeepEval summary` line.
+- Rows run in a thread pool of `EVAL_MAX_WORKERS`. Each call creates its own
+  metric instance.
+- Scores are cached per row in `deepeval_checkpoint.json`, keyed by row
+  index. A cached entry is reused only if its `question` and `answer` still
+  match.
+
+### Output: `results.csv`
+
+One row per dataset row. Columns:
+
+| Column group | Columns |
+|---|---|
+| Dataset | `question`, `ground_truth`, `article_id`, `source_title`, `source`, `topic_category`, `source_type`, `dataset_model`, `dataset_provider` |
+| Collect | `answer`, `contexts` |
+| RAGAS | `faithfulness`, `answer_relevancy`, `context_precision`, `context_recall` |
+| DeepEval | `hallucination_grounded` |
+| Run metadata | `generator_model`, `generator_provider`, `judge_model`, `judge_provider` |
+
+The printed summary shows the mean of each metric, the count of missing values
+per metric, and the count of rows with at least one missing metric. Collect-failed
+rows (empty answer) are excluded from the means.
+
+### Run directory and files
+
+`RUN_DIR` defaults to `evaluation/`. Set `EVAL_RUN_DIR` to write to a separate
+folder, for example for a pilot run.
+
+| File | Written by | Purpose |
+|---|---|---|
+| `rag_outputs_checkpoint.json` | collect | Answers and contexts per question. A cached answer is reused only if its stored question matches the row. Otherwise the log shows `Cache mismatch, re-querying`. |
+| `checkpoint.json` | RAGAS | Scored rows, in dataset order (see the row-handling table). |
+| `deepeval_checkpoint.json` | DeepEval | Per-row hallucination scores. |
+| `failed_rows.json` | `main()` | Permanent failures for this run. Rewritten on every exit, including aborts. |
+| `results.csv` | `_run_evaluation()` | Final merged output. |
+
+To start a fresh run, for example after changing a judge or generator model,
+delete the checkpoint files in the run directory.
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `EVAL_DATASET_PATH` | `evaluation/golden_dataset_openrouter.csv` | Dataset to evaluate. |
+| `EVAL_RUN_DIR` | `evaluation/` | Folder for checkpoints, `failed_rows.json`, and `results.csv`. |
+| `EVAL_CHAT_API_BASE` | `http://localhost:8000` | Backend base URL. Use `http://localhost:8686` for the backend published by Docker Compose. |
+| `EVAL_MAX_WORKERS` | `1` | Parallel workers: RAGAS processes and DeepEval threads. Raise it only after checking backend load and judge rate limits. |
+
+### Commands
 
 ```bash
-docker compose run evaluation python evaluation/generate_dataset.py
+# Host (backend running natively on port 8000, or set EVAL_CHAT_API_BASE)
+python -m evaluation.evaluate
+
+# Backend from docker compose (published on host port 8686)
+EVAL_CHAT_API_BASE=http://localhost:8686 python -m evaluation.evaluate
 ```
 
-or outside Docker with `--local` (or automatically, if the `postgres`
-hostname doesn't resolve) to load `evaluation/.env.local`'s
-localhost-mapped ports instead of the in-network service names:
+PowerShell:
 
-```bash
-python evaluation/generate_dataset.py --local
-```
-
-## `evaluate.py` — scoring the chatbot
-
-Runs from outside Docker. It reads the OpenRouter settings from `.env` (via
-`config.py`) and calls the backend's HTTP API at `http://localhost:8000` (the
-host-published port for the `backend` service), so the backend can be running
-either in Docker or natively.
-
-For every row in `evaluation/golden_dataset_openrouter.csv`:
-
-1. Opens a fresh session (`POST /api/session`) and asks the question
-   (`POST /api/chat`) — a new session per question so answers aren't
-   influenced by prior rows' conversation history.
-2. Collects the generated `answer` and the `content` text of every
-   returned source as `contexts` (see [api.md#post-apichat](api.md#post-apichat)
-   for why `/api/chat`'s `SourceOut` carries a `content` field at all).
-3. Builds a RAGAS `EvaluationDataset` from `(question, answer, contexts,
-   ground_truth)` and runs:
-   - **`faithfulness`** — does the answer's claims follow from the
-     retrieved contexts?
-   - **`answer_relevancy`** — reference-free: does the answer actually
-     address the question?
-   - **`context_precision`** / **`context_recall`** — reference-based
-     (uses `ground_truth`): are the retrieved contexts relevant and
-     sufficient to produce that ground-truth answer?
-
-   The judge LLM is `JUDGE_MODEL` on OpenRouter, wrapped for RAGAS with
-   `langchain_openai.ChatOpenAI` (`temperature=0`). The embeddings used for
-   `answer_relevancy` stay local (`sentence-transformers/all-MiniLM-L6-v2`).
-   `raise_exceptions=True` is set, so judge or parse failures stop the run
-   instead of producing silent NaN rows.
-4. Runs DeepEval's `HallucinationMetric` per row against the same
-   `contexts`, via a small `DeepEvalBaseLLM` adapter (`OpenRouterJudge`) that
-   wraps the OpenAI-compatible client pointed at OpenRouter, with the same
-   `JUDGE_MODEL`.
-5. Merges everything into one DataFrame, adds `generator_model` and
-   `judge_model` columns, writes `evaluation/results.csv`, then prints the
-   mean of each metric column together with the model names.
-
-```bash
+```powershell
+$env:EVAL_CHAT_API_BASE = "http://localhost:8686"
 python -m evaluation.evaluate
 ```
 
-Checkpoints (`evaluation/rag_outputs_checkpoint.json` and
-`evaluation/checkpoint.json`) are stored by absolute path next to the script,
-so they're found no matter which directory the script is launched from.
+Inside Docker (the `evaluation` service is in the `evaluation` profile):
 
-Each cached entry stores the question it was produced for:
+```bash
+docker compose run --rm -e EVAL_CHAT_API_BASE=http://backend:8000 evaluation python -m evaluation.evaluate
+```
 
-- **RAG answers:** a cached answer is reused only when its stored question
-  matches the current row. Otherwise the row is re-queried and the log shows
-  `Cache mismatch, re-querying`.
-- **RAGAS scores:** cached rows are reused only while their stored question and
-  answer still match the current dataset, starting from the first row. Rows
-  from the first mismatch onward are discarded and re-scored.
-
-Deleting the checkpoints is still the cleanest way to start a fresh run, for
-example after changing a judge or generator model.
-
-**Failure reporting.** RAGAS is run with `raise_exceptions=True`, so a judge
-or parse failure stops the run immediately. DeepEval fails per row: a failed
-row is recorded as `None`, and the run continues. At the end, the log prints a
-`DeepEval summary` line with the counts of failed, skipped (no contexts), and
-scored rows. The printed summary also reports how many rows are missing each
-metric and how many have at least one missing metric.
-
-Rows where retrieval returned no sources (`contexts` empty) skip the
-hallucination check (there's nothing to check groundedness against) and
-record a `None` score rather than a misleading 0 or 1.
+Inside the compose network the backend is `backend:8000`, not the host port.
+Without the `-e` flag the container would try `localhost:8000` and fail.
 
 ## Dependencies
 
-`ragas`, `deepeval`, `langchain-openai`, `langchain-huggingface`, `datasets`,
-`openai`, and `pandas` are listed in the root `requirements.txt` alongside the rest of the pipeline's dependencies —
-install with `pip install -r requirements.txt` same as everything else.
+`ragas==0.2.15`, `langchain-community<0.4`, `deepeval`, `langchain-openai`,
+`langchain-huggingface`, `datasets`, `openai`, and `pandas` are listed in the
+root `requirements.txt`. Install with `pip install -r requirements.txt`.

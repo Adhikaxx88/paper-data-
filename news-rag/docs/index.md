@@ -10,9 +10,9 @@ local, self-hosted model stack by default.
 
 - **Scrapes** Google News for a configurable list of keywords.
 - **Cleans and chunks** article text into overlapping, token-sized pieces.
-- **Embeds** each chunk with a local BGE model (`BAAI/bge-large-en-v1.5` via
-  infinity-emb) and stores the vector in Qdrant, with the text kept in
-  PostgreSQL.
+- **Embeds** each chunk with local models in-process (dense
+  `intfloat/multilingual-e5-large`, sparse BM25) and stores the vectors in
+  Qdrant, with the text kept in PostgreSQL.
 - **Backs up** each article as a categorized PDF in Google Drive.
 - **Answers questions** by retrieving the most relevant chunks and asking a
   an LLM served through OpenRouter (DeepSeek V3 by default) to answer strictly
@@ -37,7 +37,7 @@ story) without relying on a third-party search API.
 cp .env.example .env          # then set OPENROUTER_API_KEY
 docker compose up -d postgres qdrant
 docker compose run pipeline python run_pipeline.py
-docker compose up backend frontend   # chatbot at http://localhost:3000
+docker compose up backend frontend   # chatbot at http://localhost:5888
 ```
 
 See [Setup](setup.md) for prerequisites, running without Docker, and full

@@ -27,7 +27,8 @@ import random
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -309,6 +310,80 @@ def collect_rag_outputs(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+class RagasRowError(Exception):
+    """Picklable stand-in for an exception raised inside a RAGAS worker process."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message, status_code)
+
+    @property
+    def status_code(self) -> int | None:
+        return self.args[1]
+
+    def __str__(self) -> str:
+        return self.args[0]
+
+
+RAGAS_PROCESS_CTX: dict[str, Any] = {}
+
+
+def _ragas_worker_init() -> None:
+    """Run once per RAGAS worker process: load the sentence model and run config."""
+    from ragas import RunConfig
+
+    RAGAS_PROCESS_CTX["embeddings"] = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    RAGAS_PROCESS_CTX["run_config"] = RunConfig(
+        max_workers=1, timeout=600, max_retries=RAGAS_MAX_RETRIES, max_wait=RAGAS_MAX_WAIT
+    )
+
+
+def _ragas_score_in_process(row: dict) -> dict:
+    """Score one row in a worker process, on that process's main thread.
+
+    RAGAS keeps async clients, asyncio Events and metric state that are tied to
+    one event loop, and it resets shared metric.llm when a call finishes. Running
+    each worker in its own process keeps that state out of the other workers, and
+    each process runs one row at a time, as the original sequential code did.
+    """
+    from datasets import Dataset
+    from ragas import evaluate
+    from ragas.embeddings import LangchainEmbeddingsWrapper
+    from ragas.llms import LangchainLLMWrapper
+    from ragas.metrics import AnswerRelevancy, ContextPrecision, ContextRecall, Faithfulness
+
+    try:
+        judge_llm = LangchainLLMWrapper(
+            ChatOpenAI(
+                model=JUDGE_MODEL,
+                api_key=OPENROUTER_API_KEY,
+                base_url=OPENROUTER_BASE_URL,
+                temperature=0,
+                extra_body=provider_body(JUDGE_PROVIDER),
+            )
+        )
+        judge_embeddings = LangchainEmbeddingsWrapper(RAGAS_PROCESS_CTX["embeddings"])
+        metrics = [Faithfulness(), AnswerRelevancy(), ContextPrecision(), ContextRecall()]
+        result = evaluate(
+            Dataset.from_dict({k: [v] for k, v in row.items()}),
+            metrics=metrics,
+            llm=judge_llm,
+            embeddings=judge_embeddings,
+            # Surface judge/parse failures as exceptions instead of silent NaN rows.
+            raise_exceptions=True,
+            run_config=RAGAS_PROCESS_CTX["run_config"],
+        )
+        record = result.to_pandas().to_dict(orient="records")[0]
+        if has_nan(record, METRIC_COLS):
+            raise ValueError("NaN in RAGAS metrics")
+        return record
+    except Exception as e:
+        # Re-raise as a plain, picklable error that keeps the HTTP status code,
+        # so the parent can still stop on 401/402.
+        raise RagasRowError(f"{type(e).__name__}: {e}", _status_code(e)) from None
+
+
 def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
     """Score the collected rows with RAGAS's LLM-judged RAG metrics.
 
@@ -321,25 +396,6 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame with one column per RAGAS metric, indexed like df.
     """
-    from datasets import Dataset
-    from ragas import evaluate
-    from ragas.embeddings import LangchainEmbeddingsWrapper
-    from ragas.llms import LangchainLLMWrapper
-    from ragas.metrics import answer_relevancy, context_precision, context_recall, faithfulness
-
-    judge_llm = LangchainLLMWrapper(
-        ChatOpenAI(
-            model=JUDGE_MODEL,
-            api_key=OPENROUTER_API_KEY,
-            base_url=OPENROUTER_BASE_URL,
-            temperature=0,
-            extra_body=provider_body(JUDGE_PROVIDER),
-        )
-    )
-    judge_embeddings = LangchainEmbeddingsWrapper(
-        HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    )
-
     dataset = [
         {
             "user_input": row.question,
@@ -370,25 +426,10 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
     all_results = all_results[:valid]
     start_idx = valid
 
-    from ragas import RunConfig
-    run_config = RunConfig(
-        max_workers=1, timeout=600, max_retries=RAGAS_MAX_RETRIES, max_wait=RAGAS_MAX_WAIT
-    )
-
     def _score_once(row: dict) -> dict:
-        result = evaluate(
-            Dataset.from_dict({k: [v] for k, v in row.items()}),
-            metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-            llm=judge_llm,
-            embeddings=judge_embeddings,
-            # Surface judge/parse failures as exceptions instead of silent NaN rows.
-            raise_exceptions=True,
-            run_config=run_config,
-        )
-        record = result.to_pandas().to_dict(orient="records")[0]
-        if has_nan(record, METRIC_COLS):
-            raise ValueError("NaN in RAGAS metrics")
-        return record
+        # Each call goes to the process pool; a failure comes back as an exception here,
+        # so with_retry resubmits the row to a worker.
+        return proc_ex.submit(_ragas_score_in_process, row).result()
 
     # Rows are scored concurrently (EVAL_MAX_WORKERS threads), but the results
     # are consumed in dataset order below, so checkpoint writes stay a clean
@@ -398,7 +439,13 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
     def _is_scoreable(row: dict) -> bool:
         return bool(row["response"]) and bool(row["retrieved_contexts"])
 
+    # Threads only wait on the process pool; the scoring itself runs in processes.
     ex = ThreadPoolExecutor(max_workers=EVAL_MAX_WORKERS)
+    proc_ex = ProcessPoolExecutor(
+        max_workers=EVAL_MAX_WORKERS,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_ragas_worker_init,
+    )
     futures: dict[int, Any] = {}
     try:
         for idx in range(start_idx, len(dataset)):
@@ -446,6 +493,7 @@ def run_ragas(df: pd.DataFrame) -> pd.DataFrame:
     finally:
         # On abort, drop rows that have not started yet; running ones finish.
         ex.shutdown(wait=True, cancel_futures=True)
+        proc_ex.shutdown(wait=True, cancel_futures=True)
 
     if gap:
         logger.warning(f"Checkpoint stopped at the first failed row; {len(all_results)} rows saved")
